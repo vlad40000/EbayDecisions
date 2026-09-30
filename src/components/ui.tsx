@@ -214,3 +214,24 @@ export function PageHeader({
     </div>
   )
 }
+
+/**
+ * The one place that explains a database failure.
+ *
+ * A fresh deploy usually lands before Neon is wired up, so this distinguishes
+ * "you have not set DATABASE_URL" from "Neon said no" and names the next step
+ * in each case.
+ */
+export function DatabaseError({ error }: { error: string }) {
+  const unset = error.includes('DATABASE_URL')
+  return (
+    <Notice tone="bad">
+      <strong className="font-medium">Cannot reach the database.</strong>{' '}
+      {unset
+        ? 'DATABASE_URL is not set. Add your Neon pooled connection string in the Vercel project settings (or .env.local locally), then redeploy.'
+        : `Neon returned: ${error}`}{' '}
+      If the tables do not exist yet, run <code className="font-mono">pnpm db:migrate</code> and{' '}
+      <code className="font-mono">pnpm db:seed</code> against that database.
+    </Notice>
+  )
+}

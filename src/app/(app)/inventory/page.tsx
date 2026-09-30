@@ -1,6 +1,6 @@
 import { AddPartForm } from '@/components/add-part-form'
 import { PartsTable, type PartsTableRow } from '@/components/parts-table'
-import { Notice, PageHeader } from '@/components/ui'
+import { DatabaseError, PageHeader } from '@/components/ui'
 import { getSettings, listPartsWithMarket } from '@/db/queries'
 import { requireSession } from '@/lib/session'
 import { PERIODS } from '@/lib/types'
@@ -58,7 +58,7 @@ export default async function InventoryPage() {
       />
 
       {error ? (
-        <Notice tone="bad">Could not load inventory: {error}</Notice>
+        <DatabaseError error={error} />
       ) : (
         <PartsTable
           rows={rows}

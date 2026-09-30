@@ -357,3 +357,67 @@ describe('listPartsWithMarket', () => {
     expect(await getPartWithMarket('NOPE')).toBeNull()
   })
 })
+
+describe('database constraints', () => {
+  /**
+   * The app validates at the edge, but it is not the only writer — the seed
+   * script, the CSV importer and a psql session all reach these tables. These
+   * assert the database itself refuses nonsense, so a bad number cannot get in
+   * behind the application's back and quietly poison a recommendation.
+   */
+  const rejects = async (sql: string) => {
+    await expect(client.exec(sql)).rejects.toThrow()
+  }
+
+  it('refuses a negative inventory quantity', async () => {
+    await rejects(
+      `insert into parts (mpn, description, inventory_qty) values ('X1','Board',-1)`,
+    )
+  })
+
+  it('refuses an absurd cost basis', async () => {
+    await rejects(
+      `insert into parts (mpn, description, cost_basis) values ('X2','Board',9999999)`,
+    )
+  })
+
+  it('refuses an unreachable target margin', async () => {
+    await rejects(
+      `insert into parts (mpn, description, target_margin_pct) values ('X3','Board',100)`,
+    )
+  })
+
+  it('refuses a negative snapshot price', async () => {
+    const part = await createPart({ mpn: 'X4', description: 'Board' })
+    await rejects(
+      `insert into market_snapshots (part_id, period, price) values (${part.id},'7d',-5)`,
+    )
+  })
+
+  it('refuses a second settings row', async () => {
+    await getSettings()
+    await rejects(`insert into settings (id) values (2)`)
+  })
+
+  it('refuses a margin floor above the target', async () => {
+    await getSettings()
+    await rejects(`update settings set min_margin_pct = 50, target_margin_pct = 20 where id = 1`)
+  })
+
+  it('still accepts the values the app actually writes', async () => {
+    const part = await createPart({
+      mpn: 'OK-1',
+      description: 'Board',
+      inventoryQty: 0,
+      costBasis: 0,
+      targetMarginPct: 99.99,
+    })
+    expect(part.costBasis).toBe(0)
+
+    await insertSnapshots([
+      { partId: part.id, period: '7d', price: 0, shipping: 0, qty: 0, source: 'manual', sampleSize: null },
+    ])
+    await updateSettings({ minMarginPct: 15, targetMarginPct: 35 })
+    expect((await getSettings()).minMarginPct).toBeCloseTo(15, 2)
+  })
+})

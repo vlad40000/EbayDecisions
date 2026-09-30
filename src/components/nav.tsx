@@ -10,7 +10,7 @@ const LINKS = [
   { href: '/settings', label: 'Settings' },
 ] as const
 
-export function Nav({ partCount }: { partCount: number }) {
+export function Nav() {
   const pathname = usePathname()
 
   return (
@@ -21,8 +21,7 @@ export function Nav({ partCount }: { partCount: number }) {
             Ebay<span className="text-good">Decisions</span>
           </Link>
           <span className="text-ink-faint font-mono text-xs">Road Runner Appliance</span>
-          <span className="text-ink-faint ml-auto font-mono text-xs">{partCount} MPNs</span>
-          <form action="/api/auth/logout" method="post">
+          <form action="/api/auth/logout" method="post" className="ml-auto">
             <button
               type="submit"
               className="text-ink-faint hover:text-ink font-mono text-xs transition-colors"

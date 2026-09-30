@@ -9,6 +9,8 @@
  * granted. The fallback is reported in the run row, so you can always tell which
  * kind of data a given night produced.
  */
+import 'server-only'
+
 import {
   finishSyncRun,
   insertSnapshots,

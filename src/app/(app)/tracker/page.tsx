@@ -1,5 +1,5 @@
 import { MarketGrid, type GridRow } from '@/components/market-grid'
-import { Notice, PageHeader } from '@/components/ui'
+import { DatabaseError, Notice, PageHeader } from '@/components/ui'
 import { listPartsWithMarket } from '@/db/queries'
 import { requireSession } from '@/lib/session'
 
@@ -33,7 +33,7 @@ export default async function TrackerPage() {
       />
 
       {error ? (
-        <Notice tone="bad">Could not load the tracker: {error}</Notice>
+        <DatabaseError error={error} />
       ) : (
         <>
           <div className="mb-4">

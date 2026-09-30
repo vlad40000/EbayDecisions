@@ -1,6 +1,6 @@
 import { DecisionBoard, type BoardRow } from '@/components/decision-board'
 import { SyncButton } from '@/components/sync-button'
-import { Notice, PageHeader, StatCard } from '@/components/ui'
+import { DatabaseError, Notice, PageHeader, StatCard } from '@/components/ui'
 import { getSettings, listPartsWithMarket, recentSyncRuns } from '@/db/queries'
 import { decide, type Action } from '@/lib/decisions'
 import { isEbayConfigured } from '@/lib/ebay/client'
@@ -109,15 +109,18 @@ export default async function DecisionsPage() {
       <PageHeader
         title="Decisions"
         subtitle={
-          lastSync
-            ? `Last sync ${relativeTime(lastSync.at)} · ${lastSync.status}${lastSync.adapter ? ` · ${lastSync.adapter}` : ''}`
-            : 'No sync has run yet.'
+          [
+            `${rows.length} MPNs`,
+            lastSync
+              ? `last sync ${relativeTime(lastSync.at)} · ${lastSync.status}${lastSync.adapter ? ` · ${lastSync.adapter}` : ''}`
+              : 'no sync has run yet',
+          ].join(' · ')
         }
         action={<SyncButton enabled={ebayReady} />}
       />
 
       {error ? (
-        <Notice tone="bad">Could not load decisions: {error}</Notice>
+        <DatabaseError error={error} />
       ) : (
         <>
           <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-4">

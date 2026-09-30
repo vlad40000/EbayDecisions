@@ -8,6 +8,7 @@ import { hasValidSession } from '@/lib/session'
 
 const MAX_BYTES = 2 * 1024 * 1024
 const MAX_ROWS = 5000
+const MAX_AMOUNT = 1_000_000
 
 /** Accepted header spellings, normalised (case, spaces and underscores ignored). */
 const COLUMNS = {
@@ -110,8 +111,8 @@ export async function POST(request: NextRequest) {
     const qty = cell(row, 'inventoryQty')
     if (qty !== undefined && qty !== '') {
       const parsed = toNumber(qty)
-      if (parsed == null || parsed < 0) {
-        errors.push(`Line ${line}: quantity "${qty}" is not a number.`)
+      if (parsed == null || parsed < 0 || parsed > MAX_AMOUNT) {
+        errors.push(`Line ${line}: quantity "${qty}" is not a usable number.`)
         continue
       }
       input.inventoryQty = Math.round(parsed)
@@ -125,8 +126,8 @@ export async function POST(request: NextRequest) {
         continue
       }
       const parsed = toNumber(raw.replace(/^\$/, ''))
-      if (parsed == null || parsed < 0) {
-        errors.push(`Line ${line}: ${field} "${raw}" is not a number.`)
+      if (parsed == null || parsed < 0 || parsed > MAX_AMOUNT) {
+        errors.push(`Line ${line}: ${field} "${raw}" is not a usable number.`)
         continue
       }
       input[field] = parsed

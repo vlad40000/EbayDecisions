@@ -230,6 +230,21 @@ no interactive transactions, and nothing here needs one.
 top-level connect would fail the build on a machine with no `DATABASE_URL`. Deferring it means
 a missing variable shows up as a banner in the running app instead.
 
+**Neon compute is treated as something you pay for.** It bills by active time and autosuspends
+when idle, so the app never wakes it without cause: nothing polls, nothing runs on a heartbeat,
+no query happens before a visitor is authenticated, and the signed-in layout does no data
+access at all — each page loads its own data, so one page load is one query. The only scheduled
+work is the daily eBay sync.
+
+**Server modules are fenced off with `server-only`.** `src/db/*`, `src/lib/auth.ts`,
+`src/lib/session.ts` and the eBay client import it, so pulling any of them into a client bundle
+is a build error rather than a leaked connection string.
+
+**Constraints live in the database too, not only in Zod.** The app is not the only writer — the
+seed script, the CSV importer and a psql session all reach these tables — so ranges are enforced
+in Postgres as well: non-negative quantities, cost and price ceilings, margins under 100%, a
+margin floor that cannot exceed the target, and a single settings row.
+
 **Charts are not zero-baselined.** Bars are — length is the encoding there. Lines are fitted to
 the data range, because position is the encoding and a forced zero baseline flattens a real
 28% move into a straight line. The series palette is validated for colour-vision deficiency

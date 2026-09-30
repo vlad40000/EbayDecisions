@@ -1,6 +1,6 @@
 import { ImportExport } from '@/components/import-export'
 import { SettingsForm } from '@/components/settings-form'
-import { Chip, Notice, PageHeader, Panel } from '@/components/ui'
+import { Chip, DatabaseError, Notice, PageHeader, Panel } from '@/components/ui'
 import { getSettings, recentSyncRuns } from '@/db/queries'
 import { getEbayConfig, isEbayConfigured } from '@/lib/ebay/client'
 import { relativeTime } from '@/lib/format'
@@ -56,7 +56,7 @@ export default async function SettingsPage() {
         subtitle="The assumptions behind every recommendation, plus data in and out."
       />
 
-      {error && <Notice tone="bad">Could not load settings: {error}</Notice>}
+      {error && <DatabaseError error={error} />}
 
       <SettingsForm settings={settings} />
 

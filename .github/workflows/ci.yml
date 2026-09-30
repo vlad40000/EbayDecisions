@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm lint
+
+      - run: pnpm typecheck
+
+      # Runs the engine unit tests and the query integration tests. The latter
+      # apply the real migrations to Postgres-in-WebAssembly, so a migration
+      # that would fail against Neon fails here first — no database secret
+      # needed in CI.
+      - run: pnpm test
+
+      - run: pnpm build

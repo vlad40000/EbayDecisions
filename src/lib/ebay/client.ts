@@ -7,6 +7,8 @@
  * serverless instance reuses one rather than minting a token per part.
  */
 
+import 'server-only'
+
 export type EbayAdapterName = 'browse' | 'insights'
 
 export type EbayConfig = {

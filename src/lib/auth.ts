@@ -1,3 +1,5 @@
+import 'server-only'
+
 import { createHmac, timingSafeEqual } from 'node:crypto'
 
 export const SESSION_COOKIE = 'ebd_session'

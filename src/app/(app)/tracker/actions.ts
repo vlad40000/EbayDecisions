@@ -7,13 +7,18 @@ import { saveManualSnapshot } from '@/db/queries'
 import { requireSession } from '@/lib/session'
 import { PERIODS } from '@/lib/types'
 
-/** Blank clears the field; anything else must be a non-negative number. */
+/** Blank clears the field; anything else must be a sane, non-negative number. */
+const MAX_AMOUNT = 1_000_000
+
 const optionalAmount = z
   .string()
   .trim()
   .transform((value) => (value === '' ? null : Number(value)))
   .refine((value) => value === null || (Number.isFinite(value) && value >= 0), {
     message: 'Enter a number of 0 or more, or leave it blank.',
+  })
+  .refine((value) => value === null || value <= MAX_AMOUNT, {
+    message: `That is over ${MAX_AMOUNT.toLocaleString()} — check for a typo.`,
   })
 
 const schema = z.object({
