@@ -53,6 +53,9 @@ const researchWindowSchema = z
 const researchSchema = z
   .object({
     partId: z.coerce.number().int().positive(),
+    source: z
+      .enum(['ebay_product_research_manual', 'ebay_insights_reviewed'])
+      .default('ebay_product_research_manual'),
     windows: z.array(researchWindowSchema).length(PERIODS.length),
   })
   .refine(
@@ -78,8 +81,11 @@ export type SaveResearchResult =
   | { ok: true; written: number; researchedAt: string }
   | { ok: false; error: string }
 
+export type ResearchSaveSource = 'ebay_product_research_manual' | 'ebay_insights_reviewed'
+
 export async function saveResearch(input: {
   partId: number
+  source?: ResearchSaveSource
   windows: ResearchWindowFormInput[]
 }): Promise<SaveResearchResult> {
   await requireSession()
@@ -95,6 +101,7 @@ export async function saveResearch(input: {
     const written = await saveMarketResearchSession({
       partId: parsed.data.partId,
       researchedAt,
+      source: parsed.data.source,
       windows: parsed.data.windows.map((window) => ({
         period: window.period,
         avgSoldPrice: window.avgSoldPrice,
