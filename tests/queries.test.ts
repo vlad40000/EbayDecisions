@@ -26,6 +26,7 @@ import {
   listParts,
   listPartsWithMarket,
   saveManualSnapshot,
+  saveManualSnapshots,
   snapshotHistory,
   updatePart,
   updateSettings,
@@ -419,5 +420,118 @@ describe('database constraints', () => {
     ])
     await updateSettings({ minMarginPct: 15, targetMarginPct: 35 })
     expect((await getSettings()).minMarginPct).toBeCloseTo(15, 2)
+  })
+})
+
+describe('saveManualSnapshots (batched)', () => {
+  /**
+   * The grid sends a whole part at once rather than a request per field. These
+   * check the batch path does exactly what the single-window path did — coalesce
+   * recent manual rows, append past the window, and carry forward untouched
+   * fields — across several windows in one call.
+   */
+  it('writes several windows in one call', async () => {
+    const part = await createPart({ mpn: 'B1', description: 'Board' })
+
+    await saveManualSnapshots(part.id, [
+      { period: '1yr', price: 95, shipping: 15, qty: 1 },
+      { period: '6m', price: 102, shipping: 16, qty: 1 },
+      { period: '7d', price: 122, shipping: 19, qty: 2 },
+    ])
+
+    const periods = (await latestSnapshots([part.id])).get(part.id)
+    expect(periods?.['1yr']?.price).toBe(95)
+    expect(periods?.['6m']?.shipping).toBe(16)
+    expect(periods?.['7d']?.qty).toBe(2)
+    expect(periods?.['90d']).toBeUndefined()
+    expect(await snapshotHistory(part.id)).toHaveLength(3)
+  })
+
+  it('coalesces a second burst into the same rows', async () => {
+    const part = await createPart({ mpn: 'B2', description: 'Board' })
+
+    await saveManualSnapshots(part.id, [
+      { period: '30d', price: 100 },
+      { period: '7d', price: 110 },
+    ])
+    await saveManualSnapshots(part.id, [
+      { period: '30d', shipping: 12 },
+      { period: '7d', shipping: 14 },
+    ])
+
+    // Two windows, one row each — not four rows.
+    expect(await snapshotHistory(part.id)).toHaveLength(2)
+
+    const periods = (await latestSnapshots([part.id])).get(part.id)
+    expect(periods?.['30d']?.price).toBe(100)
+    expect(periods?.['30d']?.shipping).toBe(12)
+    expect(periods?.['7d']?.price).toBe(110)
+    expect(periods?.['7d']?.shipping).toBe(14)
+  })
+
+  it('mixes update and insert in one call', async () => {
+    const part = await createPart({ mpn: 'B3', description: 'Board' })
+
+    // One window already has a recent manual row; the other has none.
+    await saveManualSnapshots(part.id, [{ period: '7d', price: 100 }])
+    await saveManualSnapshots(part.id, [
+      { period: '7d', price: 105 },
+      { period: '30d', price: 98 },
+    ])
+
+    expect(await snapshotHistory(part.id)).toHaveLength(2)
+    const periods = (await latestSnapshots([part.id])).get(part.id)
+    expect(periods?.['7d']?.price).toBe(105)
+    expect(periods?.['30d']?.price).toBe(98)
+  })
+
+  it('appends rather than coalescing over an eBay row, carrying fields forward', async () => {
+    const part = await createPart({ mpn: 'B4', description: 'Board' })
+
+    await insertSnapshots([
+      { partId: part.id, period: '7d', price: 100, shipping: 14, qty: 6, source: 'ebay_insights', sampleSize: 8 },
+      { partId: part.id, period: '30d', price: 96, shipping: 13, qty: 9, source: 'ebay_insights', sampleSize: 11 },
+    ])
+
+    // Correcting only the prices must leave the synced shipping and qty intact.
+    await saveManualSnapshots(part.id, [
+      { period: '7d', price: 88 },
+      { period: '30d', price: 90 },
+    ])
+
+    const periods = (await latestSnapshots([part.id])).get(part.id)
+    expect(periods?.['7d']?.price).toBe(88)
+    expect(periods?.['7d']?.shipping).toBe(14)
+    expect(periods?.['7d']?.qty).toBe(6)
+    expect(periods?.['7d']?.source).toBe('manual')
+    expect(periods?.['30d']?.price).toBe(90)
+    expect(periods?.['30d']?.shipping).toBe(13)
+
+    // The eBay readings survive underneath.
+    expect(await snapshotHistory(part.id)).toHaveLength(4)
+  })
+
+  it('clears a field when sent null, across a batch', async () => {
+    const part = await createPart({ mpn: 'B5', description: 'Board' })
+    await saveManualSnapshots(part.id, [
+      { period: '7d', price: 100, shipping: 10 },
+      { period: '30d', price: 90, shipping: 9 },
+    ])
+    await saveManualSnapshots(part.id, [
+      { period: '7d', shipping: null },
+      { period: '30d', price: null },
+    ])
+
+    const periods = (await latestSnapshots([part.id])).get(part.id)
+    expect(periods?.['7d']?.price).toBe(100)
+    expect(periods?.['7d']?.shipping).toBeNull()
+    expect(periods?.['30d']?.price).toBeNull()
+    expect(periods?.['30d']?.shipping).toBe(9)
+  })
+
+  it('does nothing when handed no patches', async () => {
+    const part = await createPart({ mpn: 'B6', description: 'Board' })
+    await saveManualSnapshots(part.id, [])
+    expect(await snapshotHistory(part.id)).toHaveLength(0)
   })
 })

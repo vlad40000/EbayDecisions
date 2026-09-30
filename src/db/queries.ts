@@ -19,6 +19,7 @@ import {
   marketSnapshots,
   parts,
   settings,
+  type NewSnapshotRow,
   type PartRow,
   type SnapshotRow,
 } from './schema'
@@ -285,56 +286,113 @@ export type ManualSnapshotPatch = {
   qty?: number | null
 }
 
+export type WindowPatch = ManualSnapshotPatch & { period: Period }
+
 /**
- * Records a manual edit to one window.
+ * Records manual edits to one or more of a part's windows.
+ *
+ * Batched deliberately. Typing across a part's five windows used to be up to
+ * fifteen separate round-trips; this is at most three regardless — one read,
+ * one bulk update, one bulk insert — and usually two. Neon charges for the time
+ * its compute is awake, and a chatty write path is the easiest way to keep it
+ * awake for no reason.
  *
  * Two behaviours worth knowing:
  *
  * 1. A recent manual row for the same window is updated in place
- *    (MANUAL_COALESCE_MINUTES), so an editing session leaves one row.
- * 2. When a new row is appended, the untouched fields are carried forward from
- *    whatever the current values are — otherwise typing a price would silently
- *    blank the shipping figure sitting next to it. The new row is marked
- *    `manual` because a person set it.
+ *    (MANUAL_COALESCE_MINUTES), so an editing session leaves one row per window
+ *    rather than one per keystroke.
+ * 2. When a new row is appended, untouched fields are carried forward from the
+ *    live current values — otherwise typing a price would silently blank the
+ *    shipping figure beside it. Only the fields a person actually edited are
+ *    sent, so a sync that landed mid-edit is not overwritten with stale
+ *    numbers. The new row is marked `manual` because a person set it.
  */
+export async function saveManualSnapshots(
+  partId: number,
+  patches: WindowPatch[],
+): Promise<void> {
+  if (patches.length === 0) return
+
+  const periods = patches.map((patch) => patch.period)
+
+  // One read: the newest row per affected window, which is both the coalescing
+  // target and the source of any carried-forward field.
+  const currentRows = await db
+    .selectDistinctOn([marketSnapshots.period], {
+      id: marketSnapshots.id,
+      period: marketSnapshots.period,
+      price: marketSnapshots.price,
+      shipping: marketSnapshots.shipping,
+      qty: marketSnapshots.qty,
+      source: marketSnapshots.source,
+      capturedAt: marketSnapshots.capturedAt,
+    })
+    .from(marketSnapshots)
+    .where(
+      and(eq(marketSnapshots.partId, partId), inArray(marketSnapshots.period, periods)),
+    )
+    .orderBy(marketSnapshots.period, desc(marketSnapshots.capturedAt), desc(marketSnapshots.id))
+
+  const current = new Map(currentRows.map((row) => [row.period, row]))
+  const cutoff = Date.now() - MANUAL_COALESCE_MINUTES * 60 * 1000
+
+  const updates: { id: number; price: string | null; shipping: string | null; qty: number | null }[] =
+    []
+  const inserts: NewSnapshotRow[] = []
+
+  for (const patch of patches) {
+    const existing = current.get(patch.period)
+
+    const merged = {
+      price: patch.price !== undefined ? toDbNumeric(patch.price) : (existing?.price ?? null),
+      shipping:
+        patch.shipping !== undefined ? toDbNumeric(patch.shipping) : (existing?.shipping ?? null),
+      qty: patch.qty !== undefined ? patch.qty : (existing?.qty ?? null),
+    }
+
+    if (existing && existing.source === 'manual' && existing.capturedAt.getTime() >= cutoff) {
+      updates.push({ id: existing.id, ...merged })
+    } else {
+      inserts.push({
+        partId,
+        period: patch.period,
+        ...merged,
+        source: 'manual',
+        sampleSize: null,
+      })
+    }
+  }
+
+  if (updates.length > 0) {
+    // One statement for every coalesced window. The casts are load-bearing:
+    // a VALUES list of bound parameters otherwise types its columns as text,
+    // and a NULL column would have no type at all.
+    const values = updates.map(
+      (row) =>
+        sql`(${row.id}::integer, ${row.price}::numeric(10,2), ${row.shipping}::numeric(10,2), ${row.qty}::integer)`,
+    )
+
+    await db.execute(sql`
+      UPDATE ${marketSnapshots} AS m
+      SET price = v.price, shipping = v.shipping, qty = v.qty, captured_at = now()
+      FROM (VALUES ${sql.join(values, sql`, `)}) AS v(id, price, shipping, qty)
+      WHERE m.id = v.id
+    `)
+  }
+
+  if (inserts.length > 0) {
+    await db.insert(marketSnapshots).values(inserts)
+  }
+}
+
+/** Single-window convenience wrapper over the batch path. */
 export async function saveManualSnapshot(
   partId: number,
   period: Period,
   patch: ManualSnapshotPatch,
 ): Promise<void> {
-  const latest = await db
-    .select()
-    .from(marketSnapshots)
-    .where(and(eq(marketSnapshots.partId, partId), eq(marketSnapshots.period, period)))
-    .orderBy(desc(marketSnapshots.capturedAt), desc(marketSnapshots.id))
-    .limit(1)
-
-  const current = latest[0]
-  const cutoff = Date.now() - MANUAL_COALESCE_MINUTES * 60 * 1000
-
-  const merged = {
-    price:
-      patch.price !== undefined ? toDbNumeric(patch.price) : (current?.price ?? null),
-    shipping:
-      patch.shipping !== undefined ? toDbNumeric(patch.shipping) : (current?.shipping ?? null),
-    qty: patch.qty !== undefined ? patch.qty : (current?.qty ?? null),
-  }
-
-  if (current && current.source === 'manual' && current.capturedAt.getTime() >= cutoff) {
-    await db
-      .update(marketSnapshots)
-      .set({ ...merged, capturedAt: new Date() })
-      .where(eq(marketSnapshots.id, current.id))
-    return
-  }
-
-  await db.insert(marketSnapshots).values({
-    partId,
-    period,
-    ...merged,
-    source: 'manual',
-    sampleSize: null,
-  })
+  await saveManualSnapshots(partId, [{ period, ...patch }])
 }
 
 export type SyncSnapshot = {

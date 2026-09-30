@@ -236,6 +236,16 @@ no query happens before a visitor is authenticated, and the signed-in layout doe
 access at all — each page loads its own data, so one page load is one query. The only scheduled
 work is the daily eBay sync.
 
+**The tracker autosaves, but batches by part.** Filling a part's five windows means typing into
+fifteen cells; sending one request per cell would be fifteen round-trips for one part, and
+~945 to fill the catalogue. Edits are collected per part and flushed together — after a short
+pause, on Enter, or when focus leaves that part — so fifteen cells cost one request, which the
+query layer turns into at most three statements. There is no Save button to forget and nothing
+is lost if you wander off; a tab closed inside that one-second window gets a confirm prompt.
+(Blur is handled on the part's container, not per input: on each input, moving between cells
+fires a save every time and the batching buys nothing. That regression is what the counts in
+the verification below were written to catch.)
+
 **Server modules are fenced off with `server-only`.** `src/db/*`, `src/lib/auth.ts`,
 `src/lib/session.ts` and the eBay client import it, so pulling any of them into a client bundle
 is a build error rather than a leaked connection string.
