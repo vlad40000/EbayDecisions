@@ -167,6 +167,67 @@ export async function listParts(options: { includeInactive?: boolean } = {}): Pr
   return rows.map(mapPart)
 }
 
+export type InventoryPageResult = {
+  rows: Part[]
+  total: number
+  page: number
+  pageSize: number
+  pages: number
+}
+
+export async function listInventoryParts(
+  options: {
+    query?: string
+    includeInactive?: boolean
+    page?: number
+    pageSize?: number
+  } = {},
+): Promise<InventoryPageResult> {
+  const page = Math.max(1, Math.trunc(options.page ?? 1))
+  const pageSize = Math.min(100, Math.max(1, Math.trunc(options.pageSize ?? 50)))
+  const query = options.query?.trim() ?? ''
+
+  const conditions = []
+  if (!options.includeInactive) conditions.push(eq(parts.active, true))
+  if (query) {
+    const search = or(ilike(parts.mpn, `%${query}%`), ilike(parts.description, `%${query}%`))
+    if (search) conditions.push(search)
+  }
+
+  const rows = await db
+    .select({
+      totalCount: sql<number>`count(*) over()::int`,
+      id: parts.id,
+      mpn: parts.mpn,
+      description: parts.description,
+      category: parts.category,
+      inventoryQty: parts.inventoryQty,
+      costBasis: parts.costBasis,
+      shipCost: parts.shipCost,
+      targetMarginPct: parts.targetMarginPct,
+      sourceUrl: parts.sourceUrl,
+      notes: parts.notes,
+      active: parts.active,
+      createdAt: parts.createdAt,
+      updatedAt: parts.updatedAt,
+    })
+    .from(parts)
+    .where(conditions.length > 0 ? and(...conditions) : undefined)
+    .orderBy(parts.mpn)
+    .limit(pageSize)
+    .offset((page - 1) * pageSize)
+
+  const total = Number(rows[0]?.totalCount ?? 0)
+
+  return {
+    rows: rows.map(mapPart),
+    total,
+    page,
+    pageSize,
+    pages: total === 0 ? 0 : Math.ceil(total / pageSize),
+  }
+}
+
 export async function getPartByMpn(mpn: string): Promise<Part | null> {
   const rows = await db.select().from(parts).where(eq(parts.mpn, mpn)).limit(1)
   return rows[0] ? mapPart(rows[0]) : null

@@ -47,14 +47,11 @@ export default async function SettingsPage() {
     }
   }
 
-  const cronConfigured = Boolean(process.env.CRON_SECRET)
-  const cronEnabled = process.env.EBAY_CRON_ENABLED === 'true'
-
   return (
     <div className="space-y-6">
       <PageHeader
         title="Settings"
-        subtitle="The assumptions behind every recommendation, plus data in and out."
+        subtitle="Data connections, import/export, and retained listing-economics assumptions."
       />
 
       {error && <DatabaseError error={error} />}
@@ -74,18 +71,13 @@ export default async function SettingsPage() {
               <Chip>limit: {ebayDetail.limit}/run</Chip>
             </>
           )}
-          <Chip tone={cronEnabled && cronConfigured ? 'good' : cronEnabled ? 'warn' : 'dim'}>
-            {cronEnabled ? (cronConfigured ? 'Daily sync enabled' : 'Daily sync missing secret') : 'Daily sync off'}
-          </Chip>
         </div>
 
         {!ebayReady && (
           <div className="mt-3">
             <Notice tone="info">
-              Without eBay credentials the app works exactly as the spreadsheet did — you type the
-              comps and it does the maths. Set{' '}
-              <code className="font-mono">EBAY_CLIENT_ID</code> and{' '}
-              <code className="font-mono">EBAY_CLIENT_SECRET</code> to add syncing.
+              Manual Product Research remains the first-class workflow. eBay credentials can support
+              user-initiated adapter work later, but this app does not schedule a catalogue-wide research sweep.
             </Notice>
           </div>
         )}
@@ -99,9 +91,9 @@ export default async function SettingsPage() {
             comps. Sold observations and active asking-price snapshots are stored in separate streams, so sold demand can never be mistaken for competing supply. Every stored reading records its provenance.
           </p>
           <p>
-            <strong className="text-ink font-medium">The 6-month and 1-year windows.</strong> No
-            eBay API will backfill those. They fill in by hand, or they accumulate as this app keeps
-            taking readings — which is why nothing here ever invents them.
+            <strong className="text-ink font-medium">Automation boundary.</strong> Any future adapter
+            should operate on an MPN or deliberately selected working set, preserve provenance, and present
+            SOLD research for review before it becomes a dated research session.
           </p>
         </div>
       </Panel>
