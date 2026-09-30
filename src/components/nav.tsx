@@ -4,9 +4,10 @@ import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 
 const LINKS = [
-  { href: '/decisions', label: 'Decisions' },
+  { href: '/opportunities', label: 'Market Opportunities' },
+  { href: '/research', label: 'Research Queue' },
+  { href: '/tracker', label: 'Market Tracker' },
   { href: '/inventory', label: 'Inventory' },
-  { href: '/tracker', label: 'Tracker' },
   { href: '/settings', label: 'Settings' },
 ] as const
 
@@ -17,7 +18,7 @@ export function Nav() {
     <header className="border-line border-b px-6 pt-5">
       <div className="mx-auto max-w-7xl">
         <div className="mb-4 flex items-baseline gap-3">
-          <Link href="/decisions" className="text-ink text-base font-semibold tracking-tight">
+          <Link href="/opportunities" className="text-ink text-base font-semibold tracking-tight">
             Ebay<span className="text-good">Decisions</span>
           </Link>
           <span className="text-ink-faint font-mono text-xs">Road Runner Appliance</span>

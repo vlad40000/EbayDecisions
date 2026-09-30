@@ -1,6 +1,7 @@
 import 'server-only'
 
-import { and, desc, eq, gte, inArray, sql } from 'drizzle-orm'
+import { and, desc, eq, gt, gte, ilike, inArray, isNotNull, isNull, lt, or, sql } from 'drizzle-orm'
+import { alias } from 'drizzle-orm/pg-core'
 
 import { categoryOf } from '@/lib/categories'
 import { toDbNumeric, toNumber } from '@/lib/format'
@@ -243,6 +244,467 @@ export async function upsertPartByMpn(input: PartInput): Promise<'inserted' | 'u
   return 'inserted'
 }
 
+// ─── Market opportunities ────────────────────────────────────────────────────
+
+export type MarketOpportunityResearchState = 'all' | 'never' | 'stale' | 'current'
+export type MarketOpportunitySort =
+  | 'mpn'
+  | 'inventory'
+  | '7d'
+  | '30d'
+  | '90d'
+  | '6m'
+  | '1yr'
+  | 'avg-sold'
+  | 'avg-ship'
+  | 'updated'
+
+export type MarketOpportunityRow = {
+  partId: number
+  mpn: string
+  description: string
+  inventoryQty: number
+  sold7d: number | null
+  sold30d: number | null
+  sold90d: number | null
+  sold6m: number | null
+  sold1yr: number | null
+  avgSoldPrice: number | null
+  avgShipping: number | null
+  lastResearchedAt: string | null
+}
+
+export type MarketOpportunityPage = {
+  rows: MarketOpportunityRow[]
+  total: number
+  page: number
+  pageSize: number
+  pages: number
+}
+
+export type MarketOpportunityOptions = {
+  query?: string
+  inStock?: boolean
+  research?: MarketOpportunityResearchState
+  staleDays?: number
+  min30dSold?: number | null
+  minAvgSold?: number | null
+  minInventory?: number | null
+  sort?: MarketOpportunitySort
+  direction?: 'asc' | 'desc'
+  page?: number
+  pageSize?: number
+}
+
+const opportunity7d = alias(marketSnapshots, 'opportunity_7d')
+const opportunity30d = alias(marketSnapshots, 'opportunity_30d')
+const opportunity90d = alias(marketSnapshots, 'opportunity_90d')
+const opportunity6m = alias(marketSnapshots, 'opportunity_6m')
+const opportunity1yr = alias(marketSnapshots, 'opportunity_1yr')
+
+/**
+ * One server-side query for the Opportunities surface.
+ *
+ * Pagination, search, filters, sorting, latest research-session lookup, the five
+ * sold windows, and total result count all stay in Postgres. No catalogue-wide
+ * result set is returned to the browser.
+ */
+export async function listMarketOpportunities(
+  options: MarketOpportunityOptions = {},
+): Promise<MarketOpportunityPage> {
+  const page = Math.max(1, Math.trunc(options.page ?? 1))
+  const pageSize = Math.min(100, Math.max(1, Math.trunc(options.pageSize ?? 50)))
+  const staleDays = Math.min(3650, Math.max(1, Math.trunc(options.staleDays ?? 30)))
+  const research = options.research ?? 'all'
+  const sort = options.sort ?? 'updated'
+  const direction = options.direction ?? 'desc'
+  const query = options.query?.trim() ?? ''
+
+  const latestSession = db
+    .selectDistinctOn([marketResearchSessions.partId], {
+      id: marketResearchSessions.id,
+      partId: marketResearchSessions.partId,
+      researchedAt: marketResearchSessions.researchedAt,
+    })
+    .from(marketResearchSessions)
+    .orderBy(
+      marketResearchSessions.partId,
+      desc(marketResearchSessions.researchedAt),
+      desc(marketResearchSessions.id),
+    )
+    .as('latest_research_session')
+
+  const conditions = [eq(parts.active, true)]
+
+  if (query) {
+    const search = or(ilike(parts.mpn, `%${query}%`), ilike(parts.description, `%${query}%`))
+    if (search) conditions.push(search)
+  }
+  if (options.inStock) conditions.push(gt(parts.inventoryQty, 0))
+  if (options.minInventory != null) {
+    conditions.push(gte(parts.inventoryQty, Math.max(0, Math.trunc(options.minInventory))))
+  }
+  if (options.min30dSold != null) {
+    conditions.push(gte(opportunity30d.soldQty, Math.max(0, Math.trunc(options.min30dSold))))
+  }
+  if (options.minAvgSold != null) {
+    conditions.push(gte(opportunity30d.price, toDbNumeric(Math.max(0, options.minAvgSold)) ?? '0.00'))
+  }
+
+  const staleCutoff = new Date(Date.now() - staleDays * 86_400_000)
+  if (research === 'never') conditions.push(isNull(latestSession.id))
+  if (research === 'stale') {
+    conditions.push(isNotNull(latestSession.id), lt(latestSession.researchedAt, staleCutoff))
+  }
+  if (research === 'current') {
+    conditions.push(isNotNull(latestSession.id), gte(latestSession.researchedAt, staleCutoff))
+  }
+
+  const sortExpression = {
+    mpn: parts.mpn,
+    inventory: parts.inventoryQty,
+    '7d': opportunity7d.soldQty,
+    '30d': opportunity30d.soldQty,
+    '90d': opportunity90d.soldQty,
+    '6m': opportunity6m.soldQty,
+    '1yr': opportunity1yr.soldQty,
+    'avg-sold': opportunity30d.price,
+    'avg-ship': opportunity30d.shipping,
+    updated: latestSession.researchedAt,
+  }[sort]
+
+  const directionSql = direction === 'asc' ? sql.raw('asc') : sql.raw('desc')
+  const orderClause = sql`${sortExpression} ${directionSql} nulls last`
+
+  const rows = await db
+    .select({
+      totalCount: sql<number>`count(*) over()::int`,
+      partId: parts.id,
+      mpn: parts.mpn,
+      description: parts.description,
+      inventoryQty: parts.inventoryQty,
+      sold7d: opportunity7d.soldQty,
+      sold30d: opportunity30d.soldQty,
+      sold90d: opportunity90d.soldQty,
+      sold6m: opportunity6m.soldQty,
+      sold1yr: opportunity1yr.soldQty,
+      avgSoldPrice: opportunity30d.price,
+      avgShipping: opportunity30d.shipping,
+      lastResearchedAt: latestSession.researchedAt,
+    })
+    .from(parts)
+    .leftJoin(latestSession, eq(latestSession.partId, parts.id))
+    .leftJoin(
+      opportunity7d,
+      and(eq(opportunity7d.researchSessionId, latestSession.id), eq(opportunity7d.period, '7d')),
+    )
+    .leftJoin(
+      opportunity30d,
+      and(eq(opportunity30d.researchSessionId, latestSession.id), eq(opportunity30d.period, '30d')),
+    )
+    .leftJoin(
+      opportunity90d,
+      and(eq(opportunity90d.researchSessionId, latestSession.id), eq(opportunity90d.period, '90d')),
+    )
+    .leftJoin(
+      opportunity6m,
+      and(eq(opportunity6m.researchSessionId, latestSession.id), eq(opportunity6m.period, '6m')),
+    )
+    .leftJoin(
+      opportunity1yr,
+      and(eq(opportunity1yr.researchSessionId, latestSession.id), eq(opportunity1yr.period, '1yr')),
+    )
+    .where(and(...conditions))
+    .orderBy(orderClause, parts.mpn)
+    .limit(pageSize)
+    .offset((page - 1) * pageSize)
+
+  const total = Number(rows[0]?.totalCount ?? 0)
+
+  return {
+    rows: rows.map((row) => ({
+      partId: row.partId,
+      mpn: row.mpn,
+      description: row.description,
+      inventoryQty: row.inventoryQty,
+      sold7d: row.sold7d,
+      sold30d: row.sold30d,
+      sold90d: row.sold90d,
+      sold6m: row.sold6m,
+      sold1yr: row.sold1yr,
+      avgSoldPrice: toNumber(row.avgSoldPrice),
+      avgShipping: toNumber(row.avgShipping),
+      lastResearchedAt: row.lastResearchedAt?.toISOString() ?? null,
+    })),
+    total,
+    page,
+    pageSize,
+    pages: total === 0 ? 0 : Math.ceil(total / pageSize),
+  }
+}
+
+// ─── Research queue ──────────────────────────────────────────────────────────
+
+export type ResearchQueueState = 'due' | 'all' | 'never' | 'stale' | 'current'
+
+export type ResearchQueueRow = {
+  partId: number
+  mpn: string
+  description: string
+  inventoryQty: number
+  lastResearchedAt: string | null
+  ageDays: number | null
+  sold30d: number | null
+  avgSoldPrice: number | null
+  researchState: 'never' | 'stale' | 'current'
+}
+
+export type ResearchQueuePage = {
+  rows: ResearchQueueRow[]
+  total: number
+  page: number
+  pageSize: number
+  pages: number
+}
+
+export async function listResearchQueue(
+  options: {
+    query?: string
+    state?: ResearchQueueState
+    staleDays?: number
+    inStock?: boolean
+    page?: number
+    pageSize?: number
+  } = {},
+): Promise<ResearchQueuePage> {
+  const page = Math.max(1, Math.trunc(options.page ?? 1))
+  const pageSize = Math.min(100, Math.max(1, Math.trunc(options.pageSize ?? 50)))
+  const staleDays = Math.min(3650, Math.max(1, Math.trunc(options.staleDays ?? 30)))
+  const state = options.state ?? 'due'
+  const query = options.query?.trim() ?? ''
+  const staleCutoff = new Date(Date.now() - staleDays * 86_400_000)
+
+  const latestSession = db
+    .selectDistinctOn([marketResearchSessions.partId], {
+      id: marketResearchSessions.id,
+      partId: marketResearchSessions.partId,
+      researchedAt: marketResearchSessions.researchedAt,
+    })
+    .from(marketResearchSessions)
+    .orderBy(
+      marketResearchSessions.partId,
+      desc(marketResearchSessions.researchedAt),
+      desc(marketResearchSessions.id),
+    )
+    .as('queue_latest_research_session')
+
+  const queue30d = alias(marketSnapshots, 'queue_30d')
+  const conditions = [eq(parts.active, true)]
+
+  if (options.inStock !== false) conditions.push(gt(parts.inventoryQty, 0))
+  if (query) {
+    const search = or(ilike(parts.mpn, `%${query}%`), ilike(parts.description, `%${query}%`))
+    if (search) conditions.push(search)
+  }
+
+  if (state === 'due') {
+    const due = or(isNull(latestSession.id), lt(latestSession.researchedAt, staleCutoff))
+    if (due) conditions.push(due)
+  }
+  if (state === 'never') conditions.push(isNull(latestSession.id))
+  if (state === 'stale') {
+    conditions.push(isNotNull(latestSession.id), lt(latestSession.researchedAt, staleCutoff))
+  }
+  if (state === 'current') {
+    conditions.push(isNotNull(latestSession.id), gte(latestSession.researchedAt, staleCutoff))
+  }
+
+  const priority = sql<number>`
+    CASE
+      WHEN ${latestSession.id} IS NULL THEN 0
+      WHEN ${latestSession.researchedAt} < ${staleCutoff} THEN 1
+      ELSE 2
+    END
+  `
+
+  const rows = await db
+    .select({
+      totalCount: sql<number>`count(*) over()::int`,
+      partId: parts.id,
+      mpn: parts.mpn,
+      description: parts.description,
+      inventoryQty: parts.inventoryQty,
+      lastResearchedAt: latestSession.researchedAt,
+      sold30d: queue30d.soldQty,
+      avgSoldPrice: queue30d.price,
+      priority,
+    })
+    .from(parts)
+    .leftJoin(latestSession, eq(latestSession.partId, parts.id))
+    .leftJoin(
+      queue30d,
+      and(eq(queue30d.researchSessionId, latestSession.id), eq(queue30d.period, '30d')),
+    )
+    .where(and(...conditions))
+    .orderBy(priority, latestSession.researchedAt, desc(parts.inventoryQty), parts.mpn)
+    .limit(pageSize)
+    .offset((page - 1) * pageSize)
+
+  const total = Number(rows[0]?.totalCount ?? 0)
+
+  return {
+    rows: rows.map((row) => {
+      const researchedAt = row.lastResearchedAt
+      const ageDays =
+        researchedAt == null
+          ? null
+          : Math.max(0, Math.floor((Date.now() - researchedAt.getTime()) / 86_400_000))
+      const researchState =
+        researchedAt == null ? 'never' : researchedAt < staleCutoff ? 'stale' : 'current'
+
+      return {
+        partId: row.partId,
+        mpn: row.mpn,
+        description: row.description,
+        inventoryQty: row.inventoryQty,
+        lastResearchedAt: researchedAt?.toISOString() ?? null,
+        ageDays,
+        sold30d: row.sold30d,
+        avgSoldPrice: toNumber(row.avgSoldPrice),
+        researchState,
+      }
+    }),
+    total,
+    page,
+    pageSize,
+    pages: total === 0 ? 0 : Math.ceil(total / pageSize),
+  }
+}
+
+// ─── Sold Research tracker ───────────────────────────────────────────────────
+
+export type TrackerResearchRow = {
+  partId: number
+  mpn: string
+  description: string
+  inventoryQty: number
+  lastResearchedAt: string | null
+  periods: Partial<Record<Period, PeriodObservation>>
+}
+
+export type TrackerResearchPage = {
+  rows: TrackerResearchRow[]
+  total: number
+  page: number
+  pageSize: number
+  pages: number
+}
+
+export async function listTrackerResearchParts(
+  options: {
+    query?: string
+    mpns?: string[]
+    page?: number
+    pageSize?: number
+  } = {},
+): Promise<TrackerResearchPage> {
+  const page = Math.max(1, Math.trunc(options.page ?? 1))
+  const pageSize = Math.min(100, Math.max(1, Math.trunc(options.pageSize ?? 50)))
+  const query = options.query?.trim() ?? ''
+  const selectedMpns = [...new Set((options.mpns ?? []).map((mpn) => mpn.trim()).filter(Boolean))].slice(0, 20)
+
+  const latestSession = db
+    .selectDistinctOn([marketResearchSessions.partId], {
+      id: marketResearchSessions.id,
+      partId: marketResearchSessions.partId,
+      researchedAt: marketResearchSessions.researchedAt,
+    })
+    .from(marketResearchSessions)
+    .orderBy(
+      marketResearchSessions.partId,
+      desc(marketResearchSessions.researchedAt),
+      desc(marketResearchSessions.id),
+    )
+    .as('tracker_latest_research_session')
+
+  const conditions = [eq(parts.active, true)]
+  if (selectedMpns.length > 0) conditions.push(inArray(parts.mpn, selectedMpns))
+  if (query) {
+    const search = or(ilike(parts.mpn, `%${query}%`), ilike(parts.description, `%${query}%`))
+    if (search) conditions.push(search)
+  }
+
+  const pageRows = await db
+    .select({
+      totalCount: sql<number>`count(*) over()::int`,
+      partId: parts.id,
+      mpn: parts.mpn,
+      description: parts.description,
+      inventoryQty: parts.inventoryQty,
+      researchSessionId: latestSession.id,
+      lastResearchedAt: latestSession.researchedAt,
+    })
+    .from(parts)
+    .leftJoin(latestSession, eq(latestSession.partId, parts.id))
+    .where(and(...conditions))
+    .orderBy(parts.mpn)
+    .limit(pageSize)
+    .offset((page - 1) * pageSize)
+
+  const sessionIds = pageRows
+    .map((row) => row.researchSessionId)
+    .filter((id): id is number => id != null)
+
+  const periodRows =
+    sessionIds.length === 0
+      ? []
+      : await db
+          .select({
+            researchSessionId: marketSnapshots.researchSessionId,
+            period: marketSnapshots.period,
+            price: marketSnapshots.price,
+            shipping: marketSnapshots.shipping,
+            soldQty: marketSnapshots.soldQty,
+            soldPriceMin: marketSnapshots.soldPriceMin,
+            soldPriceMax: marketSnapshots.soldPriceMax,
+            totalSellers: marketSnapshots.totalSellers,
+            sellThroughPct: marketSnapshots.sellThroughPct,
+            freeShippingPct: marketSnapshots.freeShippingPct,
+            source: marketSnapshots.source,
+            priceBasis: marketSnapshots.priceBasis,
+            sampleSize: marketSnapshots.sampleSize,
+            capturedAt: marketSnapshots.capturedAt,
+          })
+          .from(marketSnapshots)
+          .where(inArray(marketSnapshots.researchSessionId, sessionIds))
+          .orderBy(marketSnapshots.researchSessionId, marketSnapshots.period)
+
+  const periodsBySession = new Map<number, Partial<Record<Period, PeriodObservation>>>()
+  for (const row of periodRows) {
+    if (row.researchSessionId == null) continue
+    const periods = periodsBySession.get(row.researchSessionId) ?? {}
+    periods[row.period as Period] = mapObservation(row)
+    periodsBySession.set(row.researchSessionId, periods)
+  }
+
+  const total = Number(pageRows[0]?.totalCount ?? 0)
+  return {
+    rows: pageRows.map((row) => ({
+      partId: row.partId,
+      mpn: row.mpn,
+      description: row.description,
+      inventoryQty: row.inventoryQty,
+      lastResearchedAt: row.lastResearchedAt?.toISOString() ?? null,
+      periods:
+        row.researchSessionId == null ? {} : periodsBySession.get(row.researchSessionId) ?? {},
+    })),
+    total,
+    page,
+    pageSize,
+    pages: total === 0 ? 0 : Math.ceil(total / pageSize),
+  }
+}
+
 // ─── Current market reads ─────────────────────────────────────────────────────
 
 export async function latestSnapshots(
@@ -321,6 +783,27 @@ export async function listPartsWithMarket(
   const ids = rows.map((part) => part.id)
   const [snapshots, active] = await Promise.all([latestSnapshots(ids), latestActiveSnapshots(ids)])
   return rows.map((part) => ({
+    ...part,
+    periods: snapshots.get(part.id) ?? {},
+    activeMarket: active.get(part.id) ?? null,
+  }))
+}
+
+export async function listPartsWithMarketForMpns(mpns: string[]): Promise<PartWithMarket[]> {
+  const normalized = [...new Set(mpns.map((mpn) => mpn.trim()).filter(Boolean))].slice(0, 20)
+  if (normalized.length === 0) return []
+
+  const partRows = await db
+    .select()
+    .from(parts)
+    .where(and(eq(parts.active, true), inArray(parts.mpn, normalized)))
+    .orderBy(parts.mpn)
+
+  const mapped = partRows.map(mapPart)
+  const ids = mapped.map((part) => part.id)
+  const [snapshots, active] = await Promise.all([latestSnapshots(ids), latestActiveSnapshots(ids)])
+
+  return mapped.map((part) => ({
     ...part,
     periods: snapshots.get(part.id) ?? {},
     activeMarket: active.get(part.id) ?? null,
