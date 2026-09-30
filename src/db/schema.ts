@@ -50,6 +50,8 @@ export const parts = pgTable(
   (t) => [
     uniqueIndex('parts_mpn_unique').on(t.mpn),
     index('parts_active_idx').on(t.active),
+    index('parts_description_idx').on(t.description),
+    index('parts_category_idx').on(t.category),
     check('parts_inventory_qty_nonneg', sql`${t.inventoryQty} >= 0`),
     check(
       'parts_cost_basis_sane',
@@ -63,6 +65,28 @@ export const parts = pgTable(
       'parts_target_margin_sane',
       sql`${t.targetMarginPct} IS NULL OR (${t.targetMarginPct} >= 0 AND ${t.targetMarginPct} < 100)`,
     ),
+  ],
+)
+
+export const marketResearchSessions = pgTable(
+  'market_research_sessions',
+  {
+    id: serial('id').primaryKey(),
+    partId: integer('part_id')
+      .notNull()
+      .references(() => parts.id, { onDelete: 'cascade' }),
+    researchedAt: timestamp('researched_at', { withTimezone: true }).notNull().defaultNow(),
+    source: text('source').notNull().default('ebay_product_research_manual'),
+    notes: text('notes'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index('research_sessions_part_researched_idx').on(
+      t.partId,
+      t.researchedAt.desc(),
+      t.id.desc(),
+    ),
+    index('research_sessions_researched_idx').on(t.researchedAt.desc()),
   ],
 )
 
@@ -83,11 +107,19 @@ export const marketSnapshots = pgTable(
     partId: integer('part_id')
       .notNull()
       .references(() => parts.id, { onDelete: 'cascade' }),
+    researchSessionId: integer('research_session_id').references(() => marketResearchSessions.id, {
+      onDelete: 'set null',
+    }),
     period: periodEnum('period').notNull(),
     price: numeric('price', { precision: 10, scale: 2 }),
     shipping: numeric('shipping', { precision: 10, scale: 2 }),
     legacyQty: integer('legacy_qty'),
     soldQty: integer('sold_qty'),
+    soldPriceMin: numeric('sold_price_min', { precision: 10, scale: 2 }),
+    soldPriceMax: numeric('sold_price_max', { precision: 10, scale: 2 }),
+    totalSellers: integer('total_sellers'),
+    sellThroughPct: numeric('sell_through_pct', { precision: 8, scale: 2 }),
+    freeShippingPct: numeric('free_shipping_pct', { precision: 5, scale: 2 }),
     source: snapshotSourceEnum('source').notNull().default('manual'),
     priceBasis: priceBasisEnum('price_basis').notNull().default('unknown'),
     sampleSize: integer('sample_size'),
@@ -95,6 +127,7 @@ export const marketSnapshots = pgTable(
   },
   (t) => [
     index('snapshots_part_period_captured_idx').on(t.partId, t.period, t.capturedAt.desc()),
+    index('snapshots_research_session_period_idx').on(t.researchSessionId, t.period),
     check(
       'snapshots_price_sane',
       sql`${t.price} IS NULL OR (${t.price} >= 0 AND ${t.price} <= 1000000)`,
@@ -105,6 +138,24 @@ export const marketSnapshots = pgTable(
     ),
     check('snapshots_legacy_qty_nonneg', sql`${t.legacyQty} IS NULL OR ${t.legacyQty} >= 0`),
     check('snapshots_sold_qty_nonneg', sql`${t.soldQty} IS NULL OR ${t.soldQty} >= 0`),
+    check(
+      'snapshots_sold_price_min_sane',
+      sql`${t.soldPriceMin} IS NULL OR (${t.soldPriceMin} >= 0 AND ${t.soldPriceMin} <= 1000000)`,
+    ),
+    check(
+      'snapshots_sold_price_max_sane',
+      sql`${t.soldPriceMax} IS NULL OR (${t.soldPriceMax} >= 0 AND ${t.soldPriceMax} <= 1000000)`,
+    ),
+    check(
+      'snapshots_sold_price_range_sane',
+      sql`${t.soldPriceMin} IS NULL OR ${t.soldPriceMax} IS NULL OR ${t.soldPriceMin} <= ${t.soldPriceMax}`,
+    ),
+    check('snapshots_total_sellers_nonneg', sql`${t.totalSellers} IS NULL OR ${t.totalSellers} >= 0`),
+    check('snapshots_sell_through_nonneg', sql`${t.sellThroughPct} IS NULL OR ${t.sellThroughPct} >= 0`),
+    check(
+      'snapshots_free_shipping_pct_sane',
+      sql`${t.freeShippingPct} IS NULL OR (${t.freeShippingPct} >= 0 AND ${t.freeShippingPct} <= 100)`,
+    ),
   ],
 )
 
@@ -201,6 +252,8 @@ export const ebaySyncRuns = pgTable(
 
 export type PartRow = typeof parts.$inferSelect
 export type NewPartRow = typeof parts.$inferInsert
+export type ResearchSessionRow = typeof marketResearchSessions.$inferSelect
+export type NewResearchSessionRow = typeof marketResearchSessions.$inferInsert
 export type SnapshotRow = typeof marketSnapshots.$inferSelect
 export type NewSnapshotRow = typeof marketSnapshots.$inferInsert
 export type ActiveSnapshotRow = typeof activeMarketSnapshots.$inferSelect
