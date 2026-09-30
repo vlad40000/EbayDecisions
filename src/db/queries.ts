@@ -581,6 +581,130 @@ export async function listResearchQueue(
   }
 }
 
+// ─── Sold Research tracker ───────────────────────────────────────────────────
+
+export type TrackerResearchRow = {
+  partId: number
+  mpn: string
+  description: string
+  inventoryQty: number
+  lastResearchedAt: string | null
+  periods: Partial<Record<Period, PeriodObservation>>
+}
+
+export type TrackerResearchPage = {
+  rows: TrackerResearchRow[]
+  total: number
+  page: number
+  pageSize: number
+  pages: number
+}
+
+export async function listTrackerResearchParts(
+  options: {
+    query?: string
+    mpns?: string[]
+    page?: number
+    pageSize?: number
+  } = {},
+): Promise<TrackerResearchPage> {
+  const page = Math.max(1, Math.trunc(options.page ?? 1))
+  const pageSize = Math.min(100, Math.max(1, Math.trunc(options.pageSize ?? 50)))
+  const query = options.query?.trim() ?? ''
+  const selectedMpns = [...new Set((options.mpns ?? []).map((mpn) => mpn.trim()).filter(Boolean))].slice(0, 20)
+
+  const latestSession = db
+    .selectDistinctOn([marketResearchSessions.partId], {
+      id: marketResearchSessions.id,
+      partId: marketResearchSessions.partId,
+      researchedAt: marketResearchSessions.researchedAt,
+    })
+    .from(marketResearchSessions)
+    .orderBy(
+      marketResearchSessions.partId,
+      desc(marketResearchSessions.researchedAt),
+      desc(marketResearchSessions.id),
+    )
+    .as('tracker_latest_research_session')
+
+  const conditions = [eq(parts.active, true)]
+  if (selectedMpns.length > 0) conditions.push(inArray(parts.mpn, selectedMpns))
+  if (query) {
+    const search = or(ilike(parts.mpn, `%${query}%`), ilike(parts.description, `%${query}%`))
+    if (search) conditions.push(search)
+  }
+
+  const pageRows = await db
+    .select({
+      totalCount: sql<number>`count(*) over()::int`,
+      partId: parts.id,
+      mpn: parts.mpn,
+      description: parts.description,
+      inventoryQty: parts.inventoryQty,
+      researchSessionId: latestSession.id,
+      lastResearchedAt: latestSession.researchedAt,
+    })
+    .from(parts)
+    .leftJoin(latestSession, eq(latestSession.partId, parts.id))
+    .where(and(...conditions))
+    .orderBy(parts.mpn)
+    .limit(pageSize)
+    .offset((page - 1) * pageSize)
+
+  const sessionIds = pageRows
+    .map((row) => row.researchSessionId)
+    .filter((id): id is number => id != null)
+
+  const periodRows =
+    sessionIds.length === 0
+      ? []
+      : await db
+          .select({
+            researchSessionId: marketSnapshots.researchSessionId,
+            period: marketSnapshots.period,
+            price: marketSnapshots.price,
+            shipping: marketSnapshots.shipping,
+            soldQty: marketSnapshots.soldQty,
+            soldPriceMin: marketSnapshots.soldPriceMin,
+            soldPriceMax: marketSnapshots.soldPriceMax,
+            totalSellers: marketSnapshots.totalSellers,
+            sellThroughPct: marketSnapshots.sellThroughPct,
+            freeShippingPct: marketSnapshots.freeShippingPct,
+            source: marketSnapshots.source,
+            priceBasis: marketSnapshots.priceBasis,
+            sampleSize: marketSnapshots.sampleSize,
+            capturedAt: marketSnapshots.capturedAt,
+          })
+          .from(marketSnapshots)
+          .where(inArray(marketSnapshots.researchSessionId, sessionIds))
+          .orderBy(marketSnapshots.researchSessionId, marketSnapshots.period)
+
+  const periodsBySession = new Map<number, Partial<Record<Period, PeriodObservation>>>()
+  for (const row of periodRows) {
+    if (row.researchSessionId == null) continue
+    const periods = periodsBySession.get(row.researchSessionId) ?? {}
+    periods[row.period as Period] = mapObservation(row)
+    periodsBySession.set(row.researchSessionId, periods)
+  }
+
+  const total = Number(pageRows[0]?.totalCount ?? 0)
+  return {
+    rows: pageRows.map((row) => ({
+      partId: row.partId,
+      mpn: row.mpn,
+      description: row.description,
+      inventoryQty: row.inventoryQty,
+      lastResearchedAt: row.lastResearchedAt?.toISOString() ?? null,
+      periods:
+        row.researchSessionId == null ? {} : periodsBySession.get(row.researchSessionId) ?? {},
+    })),
+    total,
+    page,
+    pageSize,
+    pages: total === 0 ? 0 : Math.ceil(total / pageSize),
+  }
+}
+
 // ─── Current market reads ─────────────────────────────────────────────────────
 
 export async function latestSnapshots(

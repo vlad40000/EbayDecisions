@@ -20,6 +20,7 @@ import {
   listParts,
   listPartsWithMarketForMpns,
   listResearchQueue,
+  listTrackerResearchParts,
   listPartsWithMarket,
   loadTrendSummaries,
   researchSessionHistory,
@@ -332,6 +333,46 @@ describe('Research Queue query', () => {
 
     const rows = await listPartsWithMarketForMpns(['SET-C', 'SET-A'])
     expect(rows.map((row) => row.mpn)).toEqual(['SET-A', 'SET-C'])
+  })
+})
+
+describe('Sold Research tracker query', () => {
+  it('returns only the latest dated research session, not unrelated legacy snapshots', async () => {
+    const part = await createPart({ mpn: 'TRACK-1', description: 'Board', inventoryQty: 1 })
+    await insertSoldSnapshots([
+      { partId: part.id, period: '30d', price: 999, shipping: 99, soldQty: 999, source: 'ebay_insights', sampleSize: 1 },
+    ])
+    await saveMarketResearchSession({
+      partId: part.id,
+      researchedAt: new Date('2026-09-01T12:00:00Z'),
+      windows: [{ period: '30d', avgSoldPrice: 50, avgShipping: 10, totalSold: 5 }],
+    })
+    await saveMarketResearchSession({
+      partId: part.id,
+      researchedAt: new Date('2026-09-30T12:00:00Z'),
+      windows: [{ period: '30d', avgSoldPrice: 60, avgShipping: 11, totalSold: 8 }],
+    })
+
+    const result = await listTrackerResearchParts()
+    expect(result.rows).toHaveLength(1)
+    expect(result.rows[0]?.periods['30d']?.price).toBe(60)
+    expect(result.rows[0]?.periods['30d']?.shipping).toBe(11)
+    expect(result.rows[0]?.periods['30d']?.soldQty).toBe(8)
+    expect(result.rows[0]?.lastResearchedAt).toBe('2026-09-30T12:00:00.000Z')
+  })
+
+  it('paginates and accepts an explicit queue working set', async () => {
+    await createPart({ mpn: 'TRACK-A', description: 'A', inventoryQty: 1 })
+    await createPart({ mpn: 'TRACK-B', description: 'B', inventoryQty: 1 })
+    await createPart({ mpn: 'TRACK-C', description: 'C', inventoryQty: 1 })
+
+    const selected = await listTrackerResearchParts({ mpns: ['TRACK-C', 'TRACK-A'] })
+    expect(selected.total).toBe(2)
+    expect(selected.rows.map((row) => row.mpn)).toEqual(['TRACK-A', 'TRACK-C'])
+
+    const paged = await listTrackerResearchParts({ page: 2, pageSize: 2 })
+    expect(paged.total).toBe(3)
+    expect(paged.rows.map((row) => row.mpn)).toEqual(['TRACK-C'])
   })
 })
 
