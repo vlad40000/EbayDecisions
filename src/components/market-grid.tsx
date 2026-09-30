@@ -141,7 +141,7 @@ export function MarketGrid({ rows }: { rows: GridRow[] }) {
         window[field] = value
         windows.set(period, window)
       } else if (pieces[0] === 'active') {
-        const field = pieces[1] as keyof ActiveInput
+        const field = pieces[1] as 'askingPrice' | 'askingShipping' | 'activeQty'
         active[field] = value
         hasActive = true
       }
