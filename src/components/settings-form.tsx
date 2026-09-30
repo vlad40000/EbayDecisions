@@ -23,10 +23,9 @@ export function SettingsForm({ settings }: { settings: EconomicSettings }) {
   return (
     <Panel title="Fee and margin assumptions">
       <p className="text-ink-dim mb-4 max-w-prose text-xs">
-        Every recommendation on the board is computed from these five numbers, so they live in the
-        database rather than in the code — change one and the whole board re-reads. The defaults
-        reflect a typical eBay final-value fee; check yours against a recent payout statement, since
-        the rate varies by category and store subscription.
+        These legacy economics settings are retained for downstream listing analysis and compatibility.
+        They do not rank Market Opportunities or decide what you should research. Check fee assumptions
+        against a recent eBay payout statement before using them for listing economics.
       </p>
 
       <form action={submit} className="space-y-4">
@@ -61,7 +60,7 @@ export function SettingsForm({ settings }: { settings: EconomicSettings }) {
             suffix="%"
             step={1}
             defaultValue={settings.targetMarginPct}
-            help="At or above this, a part is worth listing. Percent of net proceeds."
+            help="Optional target for downstream listing economics. It does not rank Market Opportunities."
           />
           <NumberField
             name="minMarginPct"
@@ -69,7 +68,7 @@ export function SettingsForm({ settings }: { settings: EconomicSettings }) {
             suffix="%"
             step={1}
             defaultValue={settings.minMarginPct}
-            help="Below this, a part is a problem — dump it or hold for a better market."
+            help="Optional floor for downstream listing economics. It does not create a research recommendation."
           />
         </div>
 

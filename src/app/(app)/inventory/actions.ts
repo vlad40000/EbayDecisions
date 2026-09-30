@@ -78,7 +78,6 @@ export async function savePartFields(input: PartFieldsInput): Promise<ActionResu
   }
 
   revalidatePath('/inventory')
-  revalidatePath('/decisions')
   return { ok: true }
 }
 
@@ -123,7 +122,6 @@ export async function addPart(formData: FormData): Promise<ActionResult> {
   }
 
   revalidatePath('/inventory')
-  revalidatePath('/decisions')
   revalidatePath('/tracker')
   return { ok: true }
 }
@@ -136,7 +134,6 @@ export async function setPartActive(partId: number, active: boolean): Promise<Ac
     return { ok: false, error: error instanceof Error ? error.message : 'Could not update.' }
   }
   revalidatePath('/inventory')
-  revalidatePath('/decisions')
   revalidatePath('/tracker')
   return { ok: true }
 }
@@ -150,7 +147,6 @@ export async function removePart(partId: number): Promise<ActionResult> {
     return { ok: false, error: error instanceof Error ? error.message : 'Could not delete.' }
   }
   revalidatePath('/inventory')
-  revalidatePath('/decisions')
   revalidatePath('/tracker')
   return { ok: true }
 }
@@ -200,6 +196,5 @@ export async function savePartDetail(formData: FormData): Promise<ActionResult> 
   }
 
   revalidatePath('/inventory')
-  revalidatePath('/decisions')
   return { ok: true }
 }

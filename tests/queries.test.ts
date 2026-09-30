@@ -16,6 +16,7 @@ import {
   insertSoldSnapshots,
   latestActiveSnapshots,
   latestSnapshots,
+  listInventoryParts,
   listMarketOpportunities,
   listParts,
   listPartsWithMarketForMpns,
@@ -180,6 +181,36 @@ describe('separate sold and active market streams', () => {
     await deletePart(part.id)
     expect(await testDb.select().from(marketSnapshots)).toHaveLength(0)
     expect(await testDb.select().from(activeMarketSnapshots)).toHaveLength(0)
+  })
+})
+
+describe('Inventory pagination', () => {
+  it('searches and paginates inventory without loading the full catalogue', async () => {
+    await testDb.insert(schema.parts).values(
+      Array.from({ length: 61 }, (_, index) => ({
+        mpn: `INV-${String(index + 1).padStart(3, '0')}`,
+        description: index === 40 ? 'Special Control Board' : 'Generic Part',
+        inventoryQty: index % 3,
+      })),
+    )
+
+    const page = await listInventoryParts({ page: 2, pageSize: 25 })
+    expect(page.total).toBe(61)
+    expect(page.rows).toHaveLength(25)
+    expect(page.rows[0]?.mpn).toBe('INV-026')
+
+    const search = await listInventoryParts({ query: 'Special Control' })
+    expect(search.total).toBe(1)
+    expect(search.rows[0]?.mpn).toBe('INV-041')
+  })
+
+  it('excludes inactive parts unless explicitly requested', async () => {
+    await createPart({ mpn: 'ACTIVE-I', description: 'Active', inventoryQty: 1 })
+    const inactive = await createPart({ mpn: 'INACTIVE-I', description: 'Inactive', inventoryQty: 1 })
+    await updatePart(inactive.id, { active: false })
+
+    expect((await listInventoryParts()).rows.map((row) => row.mpn)).toEqual(['ACTIVE-I'])
+    expect((await listInventoryParts({ includeInactive: true })).total).toBe(2)
   })
 })
 
