@@ -64,14 +64,14 @@ export default async function TrackerPage(props: { searchParams: PageSearchParam
     <div>
       <PageHeader
         title="Market Tracker"
-        subtitle="Manual eBay Product Research entry. The five period quantities are total SOLD, not active listings."
+        subtitle="Manual or assisted eBay Product Research. The five period quantities are total SOLD, not active listings."
       />
 
       <div className="mb-4">
         <Notice tone="info">
-          Changes stay in your browser until <strong>SAVE RESEARCH</strong>. One save creates one dated
-          research session for all five windows. No autosave, save-on-blur, polling, or active-listing
-          lookup runs from this screen.
+          Use <strong>Fetch eBay SOLD</strong> for a review-only 7d/30d/90d preview when Marketplace
+          Insights access is available. Preview values stay local until <strong>SAVE RESEARCH</strong>;
+          6m and 1yr remain manual. No autosave, polling, or automatic catalogue sweep runs here.
         </Notice>
       </div>
 

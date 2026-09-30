@@ -1,8 +1,12 @@
 /** Marketplace Insights adapter — completed sales, where access is granted. */
-import { median } from '../stats'
 import type { Period } from '../types'
 import { daysAgo, ebayGet, getEbayConfig, isoUtc, type EbayConfig } from './client'
 import { titleMatchesMpn } from './match'
+import {
+  aggregateSoldSamples,
+  type SoldSample,
+  type SoldWindowAggregate,
+} from './sold-aggregate'
 
 type ItemSale = {
   itemId?: string
@@ -17,23 +21,16 @@ type InsightsResponse = {
   itemSales?: ItemSale[]
 }
 
-export type WindowAggregate = {
-  price: number | null
-  shipping: number | null
-  soldQty: number | null
-  sampleSize: number
-}
+export type WindowAggregate = SoldWindowAggregate
 
 export type SoldWindowsResult = {
   windows: Partial<Record<Period, WindowAggregate>>
-  /** True only when every returned sale exposed a title and passed exact-MPN filtering. */
+  /** True only when every returned sale exposed a title and exact-MPN filtering was possible. */
   exactMpnVerified: boolean
   mpnRejectedCount: number
   truncated: boolean
 }
 
-export const INSIGHTS_PERIODS: Period[] = ['90d', '30d', '7d']
-const WINDOW_DAYS: Record<'90d' | '30d' | '7d', number> = { '90d': 90, '30d': 30, '7d': 7 }
 const PAGE_LIMIT = 200
 const MAX_LOOKBACK_DAYS = 90
 
@@ -69,40 +66,22 @@ export async function fetchSoldWindows(
       const soldAt = sale.lastSoldDate ? new Date(sale.lastSoldDate).getTime() : Number.NaN
       const option = sale.shippingOptions?.[0]
       const shipping = option ? Number(option.shippingCost?.value ?? '0') : null
+
       return {
         price: Number.isFinite(price) && price > 0 ? price : null,
         soldAt,
         shipping: shipping != null && Number.isFinite(shipping) ? shipping : null,
       }
     })
-    .filter((sale) => sale.price != null && Number.isFinite(sale.soldAt))
+    .filter(
+      (sale): sale is SoldSample =>
+        sale.price != null && Number.isFinite(sale.price) && Number.isFinite(sale.soldAt),
+    )
 
-  const windows: Partial<Record<Period, WindowAggregate>> = {}
-  for (const period of INSIGHTS_PERIODS) {
-    const cutoff = daysAgo(WINDOW_DAYS[period as '90d' | '30d' | '7d'], now).getTime()
-    const inWindow = sales.filter((sale) => sale.soldAt >= cutoff)
-
-    if (inWindow.length === 0) {
-      windows[period] = {
-        price: null,
-        shipping: null,
-        soldQty: truncated ? null : 0,
-        sampleSize: 0,
-      }
-      continue
-    }
-
-    windows[period] = {
-      price: median(inWindow.map((sale) => sale.price as number)),
-      shipping: median(
-        inWindow.map((sale) => sale.shipping).filter((value): value is number => value != null),
-      ),
-      // If eBay reports more matching sales than the response page contains,
-      // the true sold count is unknown. Do not write a known-under-count.
-      soldQty: truncated ? null : inWindow.length,
-      sampleSize: inWindow.length,
-    }
+  return {
+    windows: aggregateSoldSamples(sales, now, truncated),
+    exactMpnVerified,
+    mpnRejectedCount,
+    truncated,
   }
-
-  return { windows, exactMpnVerified, mpnRejectedCount, truncated }
 }

@@ -119,9 +119,9 @@ export async function runSync(trigger: 'cron' | 'manual'): Promise<SyncResult> {
           soldSnapshots.push({
             partId: part.id,
             period: period as Period,
-            price: aggregate.price,
-            shipping: aggregate.shipping,
-            soldQty: aggregate.soldQty,
+            price: aggregate.avgSoldPrice,
+            shipping: aggregate.avgShipping,
+            soldQty: aggregate.totalSold,
             source: 'ebay_insights',
             sampleSize: aggregate.sampleSize,
           })
