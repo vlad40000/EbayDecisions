@@ -1,6 +1,7 @@
 import 'server-only'
 
-import { and, desc, eq, gte, inArray, sql } from 'drizzle-orm'
+import { and, desc, eq, gt, gte, ilike, inArray, isNotNull, isNull, lt, or, sql } from 'drizzle-orm'
+import { alias } from 'drizzle-orm/pg-core'
 
 import { categoryOf } from '@/lib/categories'
 import { toDbNumeric, toNumber } from '@/lib/format'
@@ -241,6 +242,205 @@ export async function upsertPartByMpn(input: PartInput): Promise<'inserted' | 'u
   }
   await createPart(input)
   return 'inserted'
+}
+
+// ─── Market opportunities ────────────────────────────────────────────────────
+
+export type MarketOpportunityResearchState = 'all' | 'never' | 'stale' | 'current'
+export type MarketOpportunitySort =
+  | 'mpn'
+  | 'inventory'
+  | '7d'
+  | '30d'
+  | '90d'
+  | '6m'
+  | '1yr'
+  | 'avg-sold'
+  | 'avg-ship'
+  | 'updated'
+
+export type MarketOpportunityRow = {
+  partId: number
+  mpn: string
+  description: string
+  inventoryQty: number
+  sold7d: number | null
+  sold30d: number | null
+  sold90d: number | null
+  sold6m: number | null
+  sold1yr: number | null
+  avgSoldPrice: number | null
+  avgShipping: number | null
+  lastResearchedAt: string | null
+}
+
+export type MarketOpportunityPage = {
+  rows: MarketOpportunityRow[]
+  total: number
+  page: number
+  pageSize: number
+  pages: number
+}
+
+export type MarketOpportunityOptions = {
+  query?: string
+  inStock?: boolean
+  research?: MarketOpportunityResearchState
+  staleDays?: number
+  min30dSold?: number | null
+  minAvgSold?: number | null
+  minInventory?: number | null
+  sort?: MarketOpportunitySort
+  direction?: 'asc' | 'desc'
+  page?: number
+  pageSize?: number
+}
+
+const opportunity7d = alias(marketSnapshots, 'opportunity_7d')
+const opportunity30d = alias(marketSnapshots, 'opportunity_30d')
+const opportunity90d = alias(marketSnapshots, 'opportunity_90d')
+const opportunity6m = alias(marketSnapshots, 'opportunity_6m')
+const opportunity1yr = alias(marketSnapshots, 'opportunity_1yr')
+
+/**
+ * One server-side query for the Opportunities surface.
+ *
+ * Pagination, search, filters, sorting, latest research-session lookup, the five
+ * sold windows, and total result count all stay in Postgres. No catalogue-wide
+ * result set is returned to the browser.
+ */
+export async function listMarketOpportunities(
+  options: MarketOpportunityOptions = {},
+): Promise<MarketOpportunityPage> {
+  const page = Math.max(1, Math.trunc(options.page ?? 1))
+  const pageSize = Math.min(100, Math.max(1, Math.trunc(options.pageSize ?? 50)))
+  const staleDays = Math.min(3650, Math.max(1, Math.trunc(options.staleDays ?? 30)))
+  const research = options.research ?? 'all'
+  const sort = options.sort ?? 'updated'
+  const direction = options.direction ?? 'desc'
+  const query = options.query?.trim() ?? ''
+
+  const latestSession = db
+    .selectDistinctOn([marketResearchSessions.partId], {
+      id: marketResearchSessions.id,
+      partId: marketResearchSessions.partId,
+      researchedAt: marketResearchSessions.researchedAt,
+    })
+    .from(marketResearchSessions)
+    .orderBy(
+      marketResearchSessions.partId,
+      desc(marketResearchSessions.researchedAt),
+      desc(marketResearchSessions.id),
+    )
+    .as('latest_research_session')
+
+  const conditions = [eq(parts.active, true)]
+
+  if (query) {
+    const search = or(ilike(parts.mpn, `%${query}%`), ilike(parts.description, `%${query}%`))
+    if (search) conditions.push(search)
+  }
+  if (options.inStock) conditions.push(gt(parts.inventoryQty, 0))
+  if (options.minInventory != null) {
+    conditions.push(gte(parts.inventoryQty, Math.max(0, Math.trunc(options.minInventory))))
+  }
+  if (options.min30dSold != null) {
+    conditions.push(gte(opportunity30d.soldQty, Math.max(0, Math.trunc(options.min30dSold))))
+  }
+  if (options.minAvgSold != null) {
+    conditions.push(gte(opportunity30d.price, toDbNumeric(Math.max(0, options.minAvgSold)) ?? '0.00'))
+  }
+
+  const staleCutoff = new Date(Date.now() - staleDays * 86_400_000)
+  if (research === 'never') conditions.push(isNull(latestSession.id))
+  if (research === 'stale') {
+    conditions.push(isNotNull(latestSession.id), lt(latestSession.researchedAt, staleCutoff))
+  }
+  if (research === 'current') {
+    conditions.push(isNotNull(latestSession.id), gte(latestSession.researchedAt, staleCutoff))
+  }
+
+  const sortExpression = {
+    mpn: parts.mpn,
+    inventory: parts.inventoryQty,
+    '7d': opportunity7d.soldQty,
+    '30d': opportunity30d.soldQty,
+    '90d': opportunity90d.soldQty,
+    '6m': opportunity6m.soldQty,
+    '1yr': opportunity1yr.soldQty,
+    'avg-sold': opportunity30d.price,
+    'avg-ship': opportunity30d.shipping,
+    updated: latestSession.researchedAt,
+  }[sort]
+
+  const directionSql = direction === 'asc' ? sql.raw('asc') : sql.raw('desc')
+  const orderClause = sql`${sortExpression} ${directionSql} nulls last`
+
+  const rows = await db
+    .select({
+      totalCount: sql<number>`count(*) over()::int`,
+      partId: parts.id,
+      mpn: parts.mpn,
+      description: parts.description,
+      inventoryQty: parts.inventoryQty,
+      sold7d: opportunity7d.soldQty,
+      sold30d: opportunity30d.soldQty,
+      sold90d: opportunity90d.soldQty,
+      sold6m: opportunity6m.soldQty,
+      sold1yr: opportunity1yr.soldQty,
+      avgSoldPrice: opportunity30d.price,
+      avgShipping: opportunity30d.shipping,
+      lastResearchedAt: latestSession.researchedAt,
+    })
+    .from(parts)
+    .leftJoin(latestSession, eq(latestSession.partId, parts.id))
+    .leftJoin(
+      opportunity7d,
+      and(eq(opportunity7d.researchSessionId, latestSession.id), eq(opportunity7d.period, '7d')),
+    )
+    .leftJoin(
+      opportunity30d,
+      and(eq(opportunity30d.researchSessionId, latestSession.id), eq(opportunity30d.period, '30d')),
+    )
+    .leftJoin(
+      opportunity90d,
+      and(eq(opportunity90d.researchSessionId, latestSession.id), eq(opportunity90d.period, '90d')),
+    )
+    .leftJoin(
+      opportunity6m,
+      and(eq(opportunity6m.researchSessionId, latestSession.id), eq(opportunity6m.period, '6m')),
+    )
+    .leftJoin(
+      opportunity1yr,
+      and(eq(opportunity1yr.researchSessionId, latestSession.id), eq(opportunity1yr.period, '1yr')),
+    )
+    .where(and(...conditions))
+    .orderBy(orderClause, parts.mpn)
+    .limit(pageSize)
+    .offset((page - 1) * pageSize)
+
+  const total = Number(rows[0]?.totalCount ?? 0)
+
+  return {
+    rows: rows.map((row) => ({
+      partId: row.partId,
+      mpn: row.mpn,
+      description: row.description,
+      inventoryQty: row.inventoryQty,
+      sold7d: row.sold7d,
+      sold30d: row.sold30d,
+      sold90d: row.sold90d,
+      sold6m: row.sold6m,
+      sold1yr: row.sold1yr,
+      avgSoldPrice: toNumber(row.avgSoldPrice),
+      avgShipping: toNumber(row.avgShipping),
+      lastResearchedAt: row.lastResearchedAt?.toISOString() ?? null,
+    })),
+    total,
+    page,
+    pageSize,
+    pages: total === 0 ? 0 : Math.ceil(total / pageSize),
+  }
 }
 
 // ─── Current market reads ─────────────────────────────────────────────────────

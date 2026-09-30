@@ -16,6 +16,7 @@ import {
   insertSoldSnapshots,
   latestActiveSnapshots,
   latestSnapshots,
+  listMarketOpportunities,
   listParts,
   listPartsWithMarket,
   loadTrendSummaries,
@@ -176,6 +177,98 @@ describe('separate sold and active market streams', () => {
     await deletePart(part.id)
     expect(await testDb.select().from(marketSnapshots)).toHaveLength(0)
     expect(await testDb.select().from(activeMarketSnapshots)).toHaveLength(0)
+  })
+})
+
+describe('Market Opportunities query', () => {
+  it('paginates the catalogue in Postgres instead of returning the whole set', async () => {
+    await testDb.insert(schema.parts).values(
+      Array.from({ length: 55 }, (_, index) => ({
+        mpn: `PART-${String(index + 1).padStart(3, '0')}`,
+        description: 'Control Board',
+        inventoryQty: 1,
+      })),
+    )
+
+    const result = await listMarketOpportunities({
+      page: 2,
+      pageSize: 20,
+      sort: 'mpn',
+      direction: 'asc',
+    })
+
+    expect(result.total).toBe(55)
+    expect(result.rows).toHaveLength(20)
+    expect(result.rows[0]?.mpn).toBe('PART-021')
+    expect(result.rows[19]?.mpn).toBe('PART-040')
+  })
+
+  it('searches exact MPNs at the database layer', async () => {
+    await testDb.insert(schema.parts).values([
+      { mpn: 'W10830046', description: 'Refrigerator Door Gasket', inventoryQty: 1 },
+      { mpn: 'W10634026', description: 'Washer Control Board', inventoryQty: 1 },
+    ])
+
+    const result = await listMarketOpportunities({ query: 'W10830046' })
+    expect(result.total).toBe(1)
+    expect(result.rows.map((row) => row.mpn)).toEqual(['W10830046'])
+  })
+
+  it('filters by inventory, 30d sold activity, 30d average sold price, and research freshness', async () => {
+    const strong = await createPart({
+      mpn: 'STRONG-1',
+      description: 'Board',
+      inventoryQty: 3,
+    })
+    const weak = await createPart({
+      mpn: 'WEAK-1',
+      description: 'Board',
+      inventoryQty: 2,
+    })
+    await createPart({
+      mpn: 'EMPTY-1',
+      description: 'Board',
+      inventoryQty: 0,
+    })
+
+    await saveMarketResearchSession({
+      partId: strong.id,
+      researchedAt: new Date(),
+      windows: [{ period: '30d', avgSoldPrice: 75, avgShipping: 12, totalSold: 18 }],
+    })
+    await saveMarketResearchSession({
+      partId: weak.id,
+      researchedAt: new Date(),
+      windows: [{ period: '30d', avgSoldPrice: 25, avgShipping: 10, totalSold: 2 }],
+    })
+
+    const result = await listMarketOpportunities({
+      inStock: true,
+      research: 'current',
+      staleDays: 30,
+      minInventory: 1,
+      min30dSold: 5,
+      minAvgSold: 40,
+    })
+
+    expect(result.total).toBe(1)
+    expect(result.rows[0]?.mpn).toBe('STRONG-1')
+    expect(result.rows[0]?.sold30d).toBe(18)
+    expect(result.rows[0]?.avgSoldPrice).toBe(75)
+    expect(result.rows[0]?.lastResearchedAt).not.toBeNull()
+  })
+
+  it('keeps never-researched parts visibly queryable', async () => {
+    await createPart({ mpn: 'NEVER-1', description: 'Board', inventoryQty: 1 })
+    const researched = await createPart({ mpn: 'DONE-1', description: 'Board', inventoryQty: 1 })
+    await saveMarketResearchSession({
+      partId: researched.id,
+      windows: [{ period: '30d', avgSoldPrice: 50, avgShipping: 10, totalSold: 6 }],
+    })
+
+    const result = await listMarketOpportunities({ research: 'never' })
+    expect(result.rows.map((row) => row.mpn)).toEqual(['NEVER-1'])
+    expect(result.rows[0]?.lastResearchedAt).toBeNull()
   })
 })
 
