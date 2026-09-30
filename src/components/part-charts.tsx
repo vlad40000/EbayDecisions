@@ -105,16 +105,20 @@ export type PeriodPoint = {
 }
 
 function normalizePeriodData(data: PeriodPoint[]) {
-  return data.map((point) => ({
-    ...point,
-    avgSoldPrice: point.avgSoldPrice ?? point.price ?? null,
-    avgShipping: point.avgShipping ?? point.shipping ?? null,
-    delivered:
+  return data.map((point) => {
+    const avgSoldPrice = point.avgSoldPrice ?? point.price ?? null
+    const avgShipping = point.avgShipping ?? point.shipping ?? null
+    const delivered =
       point.delivered ??
-      (point.avgSoldPrice ?? point.price) == null
-        ? point.totalCost ?? null
-        : (point.avgSoldPrice ?? point.price ?? 0) + (point.avgShipping ?? point.shipping ?? 0),
-  }))
+      (avgSoldPrice == null ? point.totalCost ?? null : avgSoldPrice + (avgShipping ?? 0))
+
+    return {
+      ...point,
+      avgSoldPrice,
+      avgShipping,
+      delivered,
+    }
+  })
 }
 
 export function AverageSoldPriceChart({ data }: { data: PeriodPoint[] }) {
