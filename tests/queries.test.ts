@@ -18,6 +18,8 @@ import {
   latestSnapshots,
   listMarketOpportunities,
   listParts,
+  listPartsWithMarketForMpns,
+  listResearchQueue,
   listPartsWithMarket,
   loadTrendSummaries,
   researchSessionHistory,
@@ -269,6 +271,67 @@ describe('Market Opportunities query', () => {
     const result = await listMarketOpportunities({ research: 'never' })
     expect(result.rows.map((row) => row.mpn)).toEqual(['NEVER-1'])
     expect(result.rows[0]?.lastResearchedAt).toBeNull()
+  })
+})
+
+describe('Research Queue query', () => {
+  it('defaults to due work and orders never researched before stale', async () => {
+    await createPart({ mpn: 'NEVER-Q', description: 'Never', inventoryQty: 2 })
+    const stale = await createPart({ mpn: 'STALE-Q', description: 'Stale', inventoryQty: 1 })
+    const current = await createPart({ mpn: 'CURRENT-Q', description: 'Current', inventoryQty: 1 })
+
+    await saveMarketResearchSession({
+      partId: stale.id,
+      researchedAt: new Date(Date.now() - 45 * 86_400_000),
+      windows: [{ period: '30d', avgSoldPrice: 60, avgShipping: 12, totalSold: 8 }],
+    })
+    await saveMarketResearchSession({
+      partId: current.id,
+      researchedAt: new Date(Date.now() - 5 * 86_400_000),
+      windows: [{ period: '30d', avgSoldPrice: 70, avgShipping: 10, totalSold: 10 }],
+    })
+
+    const result = await listResearchQueue({ staleDays: 30 })
+    expect(result.rows.map((row) => row.mpn)).toEqual(['NEVER-Q', 'STALE-Q'])
+    expect(result.rows[0]?.researchState).toBe('never')
+    expect(result.rows[1]?.researchState).toBe('stale')
+    expect(result.rows[1]?.sold30d).toBe(8)
+    expect(result.rows[1]?.avgSoldPrice).toBe(60)
+  })
+
+  it('can show current rows and stays paginated', async () => {
+    for (let index = 0; index < 23; index += 1) {
+      const part = await createPart({
+        mpn: `CUR-${String(index + 1).padStart(2, '0')}`,
+        description: 'Board',
+        inventoryQty: 1,
+      })
+      await saveMarketResearchSession({
+        partId: part.id,
+        researchedAt: new Date(),
+        windows: [{ period: '30d', avgSoldPrice: 40 + index, avgShipping: 9, totalSold: index }],
+      })
+    }
+
+    const result = await listResearchQueue({ state: 'current', page: 2, pageSize: 10 })
+    expect(result.total).toBe(23)
+    expect(result.rows).toHaveLength(10)
+    expect(result.page).toBe(2)
+  })
+
+  it('can include zero-inventory parts only when explicitly requested', async () => {
+    await createPart({ mpn: 'ZERO-Q', description: 'Board', inventoryQty: 0 })
+    expect((await listResearchQueue({ state: 'never' })).total).toBe(0)
+    expect((await listResearchQueue({ state: 'never', inStock: false })).total).toBe(1)
+  })
+
+  it('loads only an explicit MPN working set for Tracker', async () => {
+    await createPart({ mpn: 'SET-A', description: 'A', inventoryQty: 1 })
+    await createPart({ mpn: 'SET-B', description: 'B', inventoryQty: 1 })
+    await createPart({ mpn: 'SET-C', description: 'C', inventoryQty: 1 })
+
+    const rows = await listPartsWithMarketForMpns(['SET-C', 'SET-A'])
+    expect(rows.map((row) => row.mpn)).toEqual(['SET-A', 'SET-C'])
   })
 })
 
