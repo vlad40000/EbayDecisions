@@ -1,182 +1,216 @@
-# EbayDecisions — canonical rebuild
+# EbayDecisions — eBay Market Research Tracker
 
-Internal appliance-parts market tracker and eBay listing decision engine for Road Runner Appliance.
+Internal appliance-parts research and prioritization tool for Road Runner Appliance.
 
 **Stack:** Next.js 16 App Router · React 19 · Neon Postgres · Drizzle · Recharts · Vercel.
 
-This rebuild uses the original EbayDecisions project as the engineering chassis and incorporates the corrected market model developed during the review session. It intentionally keeps the strong parts of the original project—Drizzle migrations, surrogate part IDs, CRUD, CSV import/export, HMAC sessions, database constraints, PGlite integration tests, sync auditing and eBay adapter orchestration—while replacing the ambiguous quantity/trend/autosave behavior.
+## Product purpose
 
-## Product rules that are now binding
+EbayDecisions answers one operational question:
 
-### 1. Sold demand and active competition are different data
+> Of the parts I already own, which MPNs show enough real SOLD activity on eBay to deserve research and listing time right now?
 
-`market_snapshots` stores the five **sold-market lookback aggregates**:
+The app supports the decision. It does not make the decision for the user.
 
-- 1 year
-- 6 months
-- 90 days
-- 30 days
+Primary workflow:
+
+1. **Market Opportunities** — search, filter, sort and paginate the catalogue using the latest dated SOLD research.
+2. **Research Queue** — identify MPNs that have never been researched or whose research is stale.
+3. **Market Tracker** — enter or review the five eBay Product Research lookback windows and press **SAVE RESEARCH**.
+4. **Part History** — compare the current five-window shape with true calendar history from repeated research sessions.
+5. **Inventory** — lightweight context only: MPN, description, category and quantity on hand.
+
+The legacy `/decisions` route redirects to Market Opportunities.
+
+## Research model
+
+The five SOLD lookback windows are:
+
 - 7 days
+- 30 days
+- 90 days
+- 6 months
+- 1 year
 
-Each row may contain item price, buyer-paid shipping, **sold quantity**, price basis, source, sample size and capture time.
+For each window the primary fields are:
 
-`active_market_snapshots` is a separate append-only stream for **point-in-time active competition**:
+- average sold price
+- average buyer-paid shipping
+- total sold
 
-- median asking price
-- median buyer-paid shipping
-- active listing count
-- sample / qualification metadata
-- capture time
+Optional Product Research fields are also supported:
 
-An active listing count is never stored as sold quantity, and sold volume is never interpreted as competing supply.
+- sold-price low/high
+- total sellers
+- sell-through %
+- free-shipping %
 
-### 2. Historical trend means actual elapsed time
-
-The five lookback windows are nested aggregates; they are not five equally spaced historical observations.
-
-The app therefore has two distinct readings:
-
-- **Current-window curve:** context across 365 / 182 / 90 / 30 / 7-day aggregates using their real spacing.
-- **Historical trend:** repeated observations of the same metric across real `captured_at` dates.
-
-Only the historical trend can influence timing recommendations. It must have:
-
-- at least **3 distinct UTC capture dates**, and
-- at least **14 days** from first to last.
-
-Multiple corrections on the same UTC day remain in the append-only audit table, but trend math collapses that day to the latest reading so a correction made minutes later cannot become a huge extrapolated “30-day trend.”
-
-### 3. Demand fallback is units per day
-
-Until longitudinal demand history matures, unequal sold windows are compared as sales velocity:
+Delivered sold price is:
 
 ```text
-sold velocity = sold_qty / window_days
+avg sold price + avg buyer-paid shipping
 ```
 
-So 8 sold in 7 days is correctly stronger demand than 20 sold in 30 days, even though the raw count is smaller.
+`total_sold` always means units sold inside that lookback window. Active listing count is never stored as sold quantity.
 
-### 4. Explicit Save MPN; no autosave
+## Dated research sessions
 
-The tracker does **not** persist on keystrokes, blur or timers.
+One **SAVE RESEARCH** creates one `market_research_sessions` row plus the supplied five lookback-window observations.
 
-- edit any fields locally
-- optionally preview eBay Active data
-- press **Save MPN**
+Research is append-only. Repeating the same research later creates a new dated session instead of overwriting the previous session.
 
-Only fields touched in the browser are submitted. The database statement reads the live latest values and carries untouched fields forward, so an eBay sync that landed after the page loaded is not overwritten by stale browser state.
+Legacy and automated snapshot rows that predate the session model remain valid with `research_session_id = NULL`. The migration does not invent historical sessions.
 
-One Save MPN is one Postgres statement for all touched sold windows plus the active-market patch. Raw history remains append-only.
+## Manual first, not manual forever
 
-There is no polling or heartbeat.
+The current production workflow is deliberately manual-first. A user transcribes eBay Product Research data and explicitly saves it. This gives the product a trustworthy baseline and prevents unreviewed external data from contaminating history.
 
-### 5. eBay Browse is a preview of active asking prices
+The intended next automation layer is **assisted research**, not an unattended catalogue sweep:
 
-The Tracker's **Preview eBay Active** button:
+1. User selects one MPN or a small working set.
+2. An authorized adapter attempts to retrieve SOLD research.
+3. Retrieved values and provenance are shown for review.
+4. The user accepts/corrects the values.
+5. **SAVE RESEARCH** persists the dated session.
 
-- runs only on user request
-- performs no Neon write
-- filters the search to used items
-- requires an exact normalized MPN title match
-- rejects longer substring matches such as `W112045170` for `W11204517`
-- records how many broad results were rejected
-- withholds active quantity when the eBay result set is truncated rather than silently saving an undercount
+There is no scheduled Vercel research cron and no automatic 40,000-part research loop.
 
-Preview values only become persistent after **Save MPN**.
+The repo still contains optional eBay adapter code and sync auditing for controlled future use. SOLD observations and active asking-price observations remain separate data streams.
 
-### 6. Marketplace Insights is a sold-data adapter, when authorized
+## Market Opportunities
 
-With `EBAY_ADAPTER=auto`, the sync probes Marketplace Insights first and falls back to Browse if the account cannot use it.
+The Opportunities surface is designed for a 40,000+ part catalogue.
 
-Insights writes only sold-window observations. Browse writes only point-in-time active-market observations. The sync audit records which adapter actually ran and separate sold/active write counts.
+Search, filters, sorting, latest-session selection, pagination and total result count are performed in Postgres. The browser does not receive the entire catalogue.
 
-If an Insights response exposes titles for all returned sales, exact-MPN filtering is applied. If the API response does not expose enough title metadata to verify that boundary, the sync records that limitation instead of claiming verification it did not perform. Truncated sales samples keep their median sample price but leave sold quantity unknown rather than storing a known undercount.
+Current filters include:
 
-## Decision engine
+- MPN / description search
+- in-stock only
+- Never researched / Stale / Current
+- configurable stale threshold
+- minimum 30-day sold volume
+- minimum 30-day average sold price
+- minimum inventory
 
-The economics remain deliberately simple and auditable:
+No black-box opportunity score is used.
 
-```text
-grossOrder  = itemPrice + buyerShipping
-fees        = grossOrder × feePct + fixedFee
-netProceeds = grossOrder − fees − actualShipCost
-margin$     = netProceeds − costBasis
-margin%     = margin$ / netProceeds
-```
+## Research Queue
 
-A cost basis of `0` is valid and distinct from an unknown/null cost basis.
+Research Queue answers: **What should I research next?**
 
-Settings are editable in the app:
+Default behavior:
 
-- eBay percentage fee
-- eBay fixed fee
-- default actual shipping cost
-- target margin
-- minimum margin floor
+- in-stock MPNs only
+- Never researched first
+- Stale rows next, oldest first
+- 30-day stale threshold by default
+- working sets capped at 20 MPNs
+- selection is local-only until the user opens Tracker
+- selection does not trigger eBay calls or Neon writes
 
-The suggested list price is solved backwards through the same fee model to hit the selected target margin.
+## Market Tracker
 
-Timing rules use qualified historical signals only. A current-window curve is visible for context but cannot by itself force `LIST_NOW`, `HOLD` or `DUMP` based on trend.
+Tracker is the explicit research-entry surface.
 
-## Data migration
+The compact table shows:
 
-Migration `0002_market_semantics.sql` converts the original overloaded `qty` model safely:
+- MPN
+- quantity
+- description
+- 7d / 30d / 90d / 6m / 1y total SOLD
+- last researched state
 
-- old `ebay_insights.qty` → `sold_qty`
-- old `ebay_browse` rows → `active_market_snapshots`
-- old manual `qty` stays in `legacy_qty` for audit because its meaning cannot be inferred safely
-- old Browse rows are removed from sold-window history after being copied to active-market history
+The expanded editor supports the full Product Research fields for each window.
 
-The migration never guesses whether an ambiguous manual legacy quantity meant sold units or active listings.
+All edits stay in the browser until **SAVE RESEARCH**. There is no autosave, save-on-blur, polling or heartbeat.
+
+## Part History
+
+Part History separates two different concepts.
+
+### Current cross-window shape
+
+The three primary charts are:
+
+1. Average Sold Price by Lookback Window
+2. Avg Sold Price vs Avg Shipping
+3. Units Sold by Period
+
+These are nested lookback aggregates. They are not a calendar time series.
+
+### True calendar history
+
+Repeated dated sessions create:
+
+- 30-day Avg Sold Price History
+- 30-day Units Sold History
+
+Same-day corrections remain stored but collapse to the latest value for chart/trend math.
+
+A mature trend requires:
+
+- at least 3 distinct research dates
+- at least 14 days from first to last
+
+With fewer than 2 dates, the UI shows an explicit insufficient-history state. It never fabricates chart data.
+
+## Inventory boundary
+
+Inventory is context, not a second warehouse system.
+
+Retained here:
+
+- MPN
+- description
+- category
+- quantity on hand
+- import/export
+- part notes/reference metadata
+
+Inventory search and pagination are server-side.
+
+Operational listing, reserved/sold state, warehouse state and sales ledger functionality belong in Roadrunner Parts Ledger rather than being duplicated here.
+
+## Database and migrations
+
+Current migration sequence includes:
+
+- `0000_*.sql`
+- `0001_*.sql`
+- `0002_market_semantics.sql`
+- `0003_market_research_sessions.sql`
+
+Migration `0002` separates sold demand from point-in-time active competition.
+
+Migration `0003` adds:
+
+- `market_research_sessions`
+- nullable `research_session_id` on sold snapshots
+- optional Product Research metrics
+- research-session and catalogue search indexes
+
+Production `0003` has been applied.
 
 ## Neon compute discipline
 
-The app is designed to avoid unnecessary Neon compute:
+The application is intentionally conservative with Neon compute:
 
 - lazy database connection
-- no database work before an authenticated request needs it
-- no autosave (market tracker or inventory economics)
-- inventory rows use explicit **Save Part**; market rows use explicit **Save MPN**
-- no client polling / heartbeat
-- one explicit Save MPN statement
-- eBay active preview does not touch Neon
-- scheduled eBay sync is **off by default**
-
-`vercel.json` retains the cron definition so it can be enabled later, but `/api/cron/sync` returns before reading from Neon unless:
-
-```text
-EBAY_CRON_ENABLED=true
-```
-
-When enabled, `CRON_SECRET` is also required.
-
-## Charts
-
-Part detail pages separate the meanings visually:
-
-- **Area + fitted line:** current sold-window buyer-total curve using true lookback spacing; context only
-- **Stacked bar:** item price vs buyer-paid shipping
-- **Bar:** sold velocity in units/day
-- **Calendar line:** repeated sold-price observations over actual capture dates
-- **Calendar bar:** point-in-time active-listing competition over actual capture dates
-
-No random market prices are seeded.
-
-## Inventory and data operations
-
-The stronger original workflows are preserved:
-
-- add / edit / delete parts
-- active / inactive inventory
-- MPN is unique business data; internal relationships use surrogate `part_id`
-- CSV bulk import
-- full CSV export with sold/active fields and decision metadata
-- 63-part seed catalogue, idempotent by MPN
-- sync-run audit log
+- no client polling or heartbeat
+- no autosave
+- no per-keystroke writes
+- explicit quantity saves in Inventory
+- explicit SAVE RESEARCH in Tracker
+- server-side pagination instead of full-catalogue reads
+- no scheduled eBay research cron
+- no automatic 40,000-part research sweep
 
 ## Authentication
 
-`APP_PASSWORD` is the shared sign-in password. `AUTH_SECRET` independently HMAC-signs a session payload containing its expiration time. `proxy.ts` handles page navigation, and server actions/routes re-check the session at the data boundary.
+`APP_PASSWORD` is the shared sign-in password.
+
+`AUTH_SECRET` independently signs expiring sessions. Server actions and protected data routes re-check authentication at the data boundary.
 
 Changing `AUTH_SECRET` invalidates existing sessions.
 
@@ -199,16 +233,7 @@ APP_PASSWORD
 AUTH_SECRET
 ```
 
-Optional eBay and cron variables are documented in `.env.example`.
-
-## Vercel
-
-1. Create/import the GitHub repository in Vercel.
-2. Add `DATABASE_URL`, `APP_PASSWORD`, and `AUTH_SECRET` to the intended environments.
-3. Add eBay variables only if sync/preview is wanted.
-4. Leave `EBAY_CRON_ENABLED=false` until scheduled sync is intentionally enabled.
-5. Run the production migrations and seed once against the chosen Neon database.
-6. Let CI and Vercel build the same committed source.
+eBay credentials are optional and are not required for the manual Product Research workflow.
 
 ## Verification
 
@@ -223,52 +248,17 @@ runs:
 3. Vitest
 4. production Next.js build
 
-The query integration tests run the real migration SQL and query layer against PGlite/Postgres semantics, including the sold/active split, legacy migration behavior, explicit-save carry-forward, constraints and historical trend qualification.
+PGlite query tests exercise the real migration SQL and Postgres-oriented query semantics, including research sessions, pagination, research freshness and explicit saves.
 
-## Layout
+## Primary routes
 
 ```text
-proxy.ts
-vercel.json
-.github/workflows/ci.yml
-
-drizzle/
-  0000_*.sql
-  0001_*.sql
-  0002_market_semantics.sql
-
-src/
-  app/(app)/
-    decisions/
-    inventory/
-    inventory/[mpn]/
-    tracker/
-    settings/
-  app/api/
-    cron/sync/
-    ebay/preview/[mpn]/
-    ebay/sync/
-    parts/import/
-    parts/export/
-  components/
-  db/
-    schema.ts
-    queries.ts
-    seed-data.ts
-    seed.ts
-  lib/
-    decisions.ts
-    stats.ts
-    auth.ts
-    session.ts
-    ebay/
-      browse.ts
-      insights.ts
-      match.ts
-      sync.ts
-
-tests/
-  decisions.test.ts
-  ebay-match.test.ts
-  queries.test.ts
+/                  -> /opportunities
+/opportunities     Market Opportunities
+/research          Research Queue
+/tracker           Market Tracker
+/inventory         Inventory context
+/inventory/[mpn]   Part History dashboard
+/settings          Connections, import/export and retained compatibility settings
+/decisions         -> /opportunities
 ```
