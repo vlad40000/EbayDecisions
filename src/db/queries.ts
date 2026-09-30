@@ -208,6 +208,7 @@ export async function listInventoryParts(
       sourceUrl: parts.sourceUrl,
       notes: parts.notes,
       active: parts.active,
+      createdAt: parts.createdAt,
       updatedAt: parts.updatedAt,
     })
     .from(parts)
