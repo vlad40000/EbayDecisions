@@ -20,6 +20,7 @@ export default async function TrackerPage() {
       description: part.description,
       inventoryQty: part.inventoryQty,
       periods: part.periods,
+      activeMarket: part.activeMarket,
     }))
   } catch (caught) {
     error = caught instanceof Error ? caught.message : String(caught)
@@ -29,7 +30,7 @@ export default async function TrackerPage() {
     <div>
       <PageHeader
         title="Market Tracker"
-        subtitle="Comps per lookback window. Every edit is kept as history, so trends are real rather than a snapshot."
+        subtitle="Sold-market lookback windows plus point-in-time active competition. Manual edits stay local until Save MPN."
       />
 
       {error ? (
@@ -38,9 +39,10 @@ export default async function TrackerPage() {
         <>
           <div className="mb-4">
             <Notice tone="info">
-              Windows run 1 year → 7 days, oldest to newest, which is the direction the trend math
-              and charts read. eBay&apos;s sold-comp history only reaches back 90 days, so the
-              6-month and 1-year windows fill in by hand or accumulate as this app keeps running.
+              Sold counts belong to the 1-year → 7-day lookback windows. Active listing count is a
+              separate point-in-time capture. Historical trends only become actionable after at least
+              three distinct capture dates spanning 14 days; same-day corrections remain in the audit
+              trail but collapse to the latest reading for trend math.
             </Notice>
           </div>
           <MarketGrid rows={rows} />

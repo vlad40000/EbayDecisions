@@ -1,5 +1,4 @@
-/** Lookback windows, ordered oldest -> newest. Order is load-bearing: the
- *  trend regression and every chart read this array left to right as time. */
+/** Lookback windows for sold-market aggregates, oldest -> newest. */
 export const PERIODS = ['1yr', '6m', '90d', '30d', '7d'] as const
 export type Period = (typeof PERIODS)[number]
 
@@ -11,7 +10,7 @@ export const PERIOD_LABELS: Record<Period, string> = {
   '7d': '7 Days',
 }
 
-/** Approximate days each window spans. Used to size eBay date filters. */
+/** Approximate span represented by each sold-data aggregate. */
 export const PERIOD_DAYS: Record<Period, number> = {
   '1yr': 365,
   '6m': 182,
@@ -21,30 +20,42 @@ export const PERIOD_DAYS: Record<Period, number> = {
 }
 
 export type SnapshotSource = 'manual' | 'ebay_browse' | 'ebay_insights'
+export type PriceBasis = 'unknown' | 'sold' | 'asking'
 
 export const SOURCE_LABELS: Record<SnapshotSource, string> = {
   manual: 'Manual',
-  ebay_browse: 'Active listings',
-  ebay_insights: 'Sold comps',
+  ebay_browse: 'eBay active listings',
+  ebay_insights: 'eBay sold comps',
 }
 
-/**
- * Whether a source reflects completed sales. Asking prices on active listings
- * are not comps — an unsold listing at $200 tells you nothing about what the
- * part fetches. The UI flags decisions built on asking prices.
- */
-export const SOURCE_IS_SOLD: Record<SnapshotSource, boolean> = {
-  manual: true,
-  ebay_browse: false,
-  ebay_insights: true,
+export const PRICE_BASIS_LABELS: Record<PriceBasis, string> = {
+  unknown: 'Unknown basis',
+  sold: 'Sold comps',
+  asking: 'Asking prices',
 }
 
 export type PeriodObservation = {
   price: number | null
   shipping: number | null
-  qty: number | null
+  /** Units sold inside this lookback window. Never active-listing count. */
+  soldQty: number | null
   source: SnapshotSource
+  priceBasis: PriceBasis
   sampleSize: number | null
+  capturedAt: string
+}
+
+/** Active competition is a point-in-time observation, not a lookback window. */
+export type ActiveMarketObservation = {
+  askingPrice: number | null
+  askingShipping: number | null
+  activeQty: number | null
+  source: 'manual' | 'ebay_browse'
+  sampleSize: number | null
+  broadMatchCount: number | null
+  mpnRejectedCount: number | null
+  conditionRejectedCount: number | null
+  truncated: boolean
   capturedAt: string
 }
 
@@ -72,6 +83,24 @@ export type EconomicSettings = {
 }
 
 export type PartWithMarket = Part & {
-  /** Newest observation per window. Missing windows are simply absent. */
+  /** Newest sold/market observation per lookback window. */
   periods: Partial<Record<Period, PeriodObservation>>
+  /** Newest point-in-time active competition observation. */
+  activeMarket: ActiveMarketObservation | null
+}
+
+export type TrendBasis = 'history' | 'window-curve' | 'window-velocity' | 'insufficient'
+
+export type TrendSummary = {
+  marketPctPer30d: number | null
+  marketPoints: number
+  marketSpanDays: number
+  marketPeriod: Period | null
+  demandPctPer30d: number | null
+  demandPoints: number
+  demandSpanDays: number
+  demandPeriod: Period | null
+  supplyPctPer30d: number | null
+  supplyPoints: number
+  supplySpanDays: number
 }

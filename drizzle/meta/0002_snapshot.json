@@ -1,0 +1,689 @@
+{
+  "id": "08e1ec1a-77b7-4b69-ab0e-5d4f232b6be6",
+  "prevId": "02b0ad3d-f731-4ac0-96db-8d84a9cdbc3c",
+  "version": "7",
+  "dialect": "postgresql",
+  "tables": {
+    "public.ebay_sync_runs": {
+      "name": "ebay_sync_runs",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "serial",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "started_at": {
+          "name": "started_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "finished_at": {
+          "name": "finished_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "status": {
+          "name": "status",
+          "type": "sync_status",
+          "typeSchema": "public",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'running'"
+        },
+        "adapter": {
+          "name": "adapter",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "trigger": {
+          "name": "trigger",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'manual'"
+        },
+        "parts_processed": {
+          "name": "parts_processed",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "parts_failed": {
+          "name": "parts_failed",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "snapshots_written": {
+          "name": "snapshots_written",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "sold_snapshots_written": {
+          "name": "sold_snapshots_written",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "active_snapshots_written": {
+          "name": "active_snapshots_written",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "error": {
+          "name": "error",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "sync_runs_started_idx": {
+          "name": "sync_runs_started_idx",
+          "columns": [
+            {
+              "expression": "started_at",
+              "isExpression": false,
+              "asc": false,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.market_snapshots": {
+      "name": "market_snapshots",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "serial",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "part_id": {
+          "name": "part_id",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "period": {
+          "name": "period",
+          "type": "period",
+          "typeSchema": "public",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "price": {
+          "name": "price",
+          "type": "numeric(10, 2)",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "shipping": {
+          "name": "shipping",
+          "type": "numeric(10, 2)",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "legacy_qty": {
+          "name": "legacy_qty",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "sold_qty": {
+          "name": "sold_qty",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "source": {
+          "name": "source",
+          "type": "snapshot_source",
+          "typeSchema": "public",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'manual'"
+        },
+        "price_basis": {
+          "name": "price_basis",
+          "type": "price_basis",
+          "typeSchema": "public",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'unknown'"
+        },
+        "sample_size": {
+          "name": "sample_size",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "captured_at": {
+          "name": "captured_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "snapshots_part_period_captured_idx": {
+          "name": "snapshots_part_period_captured_idx",
+          "columns": [
+            {
+              "expression": "part_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "period",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "captured_at",
+              "isExpression": false,
+              "asc": false,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "market_snapshots_part_id_parts_id_fk": {
+          "name": "market_snapshots_part_id_parts_id_fk",
+          "tableFrom": "market_snapshots",
+          "tableTo": "parts",
+          "columnsFrom": [
+            "part_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "snapshots_price_sane": {
+          "name": "snapshots_price_sane",
+          "value": "\"market_snapshots\".\"price\" IS NULL OR (\"market_snapshots\".\"price\" >= 0 AND \"market_snapshots\".\"price\" <= 1000000)"
+        },
+        "snapshots_shipping_sane": {
+          "name": "snapshots_shipping_sane",
+          "value": "\"market_snapshots\".\"shipping\" IS NULL OR (\"market_snapshots\".\"shipping\" >= 0 AND \"market_snapshots\".\"shipping\" <= 1000000)"
+        },
+        "snapshots_legacy_qty_nonneg": {
+          "name": "snapshots_legacy_qty_nonneg",
+          "value": "\"market_snapshots\".\"legacy_qty\" IS NULL OR \"market_snapshots\".\"legacy_qty\" >= 0"
+        },
+        "snapshots_sold_qty_nonneg": {
+          "name": "snapshots_sold_qty_nonneg",
+          "value": "\"market_snapshots\".\"sold_qty\" IS NULL OR \"market_snapshots\".\"sold_qty\" >= 0"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.parts": {
+      "name": "parts",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "serial",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "mpn": {
+          "name": "mpn",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "description": {
+          "name": "description",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "category": {
+          "name": "category",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "inventory_qty": {
+          "name": "inventory_qty",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "cost_basis": {
+          "name": "cost_basis",
+          "type": "numeric(10, 2)",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "ship_cost": {
+          "name": "ship_cost",
+          "type": "numeric(10, 2)",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "target_margin_pct": {
+          "name": "target_margin_pct",
+          "type": "numeric(5, 2)",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "source_url": {
+          "name": "source_url",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "notes": {
+          "name": "notes",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "active": {
+          "name": "active",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "parts_mpn_unique": {
+          "name": "parts_mpn_unique",
+          "columns": [
+            {
+              "expression": "mpn",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "parts_active_idx": {
+          "name": "parts_active_idx",
+          "columns": [
+            {
+              "expression": "active",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "parts_inventory_qty_nonneg": {
+          "name": "parts_inventory_qty_nonneg",
+          "value": "\"parts\".\"inventory_qty\" >= 0"
+        },
+        "parts_cost_basis_sane": {
+          "name": "parts_cost_basis_sane",
+          "value": "\"parts\".\"cost_basis\" IS NULL OR (\"parts\".\"cost_basis\" >= 0 AND \"parts\".\"cost_basis\" <= 1000000)"
+        },
+        "parts_ship_cost_sane": {
+          "name": "parts_ship_cost_sane",
+          "value": "\"parts\".\"ship_cost\" IS NULL OR (\"parts\".\"ship_cost\" >= 0 AND \"parts\".\"ship_cost\" <= 1000000)"
+        },
+        "parts_target_margin_sane": {
+          "name": "parts_target_margin_sane",
+          "value": "\"parts\".\"target_margin_pct\" IS NULL OR (\"parts\".\"target_margin_pct\" >= 0 AND \"parts\".\"target_margin_pct\" < 100)"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.settings": {
+      "name": "settings",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "integer",
+          "primaryKey": true,
+          "notNull": true,
+          "default": 1
+        },
+        "fee_pct": {
+          "name": "fee_pct",
+          "type": "numeric(5, 2)",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'13.25'"
+        },
+        "fee_fixed": {
+          "name": "fee_fixed",
+          "type": "numeric(10, 2)",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'0.30'"
+        },
+        "default_ship_cost": {
+          "name": "default_ship_cost",
+          "type": "numeric(10, 2)",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'12.00'"
+        },
+        "target_margin_pct": {
+          "name": "target_margin_pct",
+          "type": "numeric(5, 2)",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'35.00'"
+        },
+        "min_margin_pct": {
+          "name": "min_margin_pct",
+          "type": "numeric(5, 2)",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'15.00'"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "settings_single_row": {
+          "name": "settings_single_row",
+          "value": "\"settings\".\"id\" = 1"
+        },
+        "settings_fee_pct_sane": {
+          "name": "settings_fee_pct_sane",
+          "value": "\"settings\".\"fee_pct\" >= 0 AND \"settings\".\"fee_pct\" < 100"
+        },
+        "settings_fee_fixed_sane": {
+          "name": "settings_fee_fixed_sane",
+          "value": "\"settings\".\"fee_fixed\" >= 0 AND \"settings\".\"fee_fixed\" <= 1000"
+        },
+        "settings_ship_cost_sane": {
+          "name": "settings_ship_cost_sane",
+          "value": "\"settings\".\"default_ship_cost\" >= 0 AND \"settings\".\"default_ship_cost\" <= 1000000"
+        },
+        "settings_target_margin_sane": {
+          "name": "settings_target_margin_sane",
+          "value": "\"settings\".\"target_margin_pct\" >= 0 AND \"settings\".\"target_margin_pct\" < 100"
+        },
+        "settings_min_margin_sane": {
+          "name": "settings_min_margin_sane",
+          "value": "\"settings\".\"min_margin_pct\" >= 0 AND \"settings\".\"min_margin_pct\" < 100"
+        },
+        "settings_floor_below_target": {
+          "name": "settings_floor_below_target",
+          "value": "\"settings\".\"min_margin_pct\" <= \"settings\".\"target_margin_pct\""
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.active_market_snapshots": {
+      "name": "active_market_snapshots",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "serial",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "part_id": {
+          "name": "part_id",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "asking_price": {
+          "name": "asking_price",
+          "type": "numeric(10, 2)",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "asking_shipping": {
+          "name": "asking_shipping",
+          "type": "numeric(10, 2)",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "active_qty": {
+          "name": "active_qty",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "source": {
+          "name": "source",
+          "type": "snapshot_source",
+          "typeSchema": "public",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'manual'"
+        },
+        "sample_size": {
+          "name": "sample_size",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "broad_match_count": {
+          "name": "broad_match_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "mpn_rejected_count": {
+          "name": "mpn_rejected_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "condition_rejected_count": {
+          "name": "condition_rejected_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "truncated": {
+          "name": "truncated",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "captured_at": {
+          "name": "captured_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "active_snapshots_part_captured_idx": {
+          "name": "active_snapshots_part_captured_idx",
+          "columns": [
+            {
+              "expression": "part_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "captured_at",
+              "isExpression": false,
+              "asc": false,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "active_market_snapshots_part_id_parts_id_fk": {
+          "name": "active_market_snapshots_part_id_parts_id_fk",
+          "tableFrom": "active_market_snapshots",
+          "tableTo": "parts",
+          "columnsFrom": [
+            "part_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "active_snapshots_price_sane": {
+          "name": "active_snapshots_price_sane",
+          "value": "\"active_market_snapshots\".\"asking_price\" IS NULL OR (\"active_market_snapshots\".\"asking_price\" >= 0 AND \"active_market_snapshots\".\"asking_price\" <= 1000000)"
+        },
+        "active_snapshots_shipping_sane": {
+          "name": "active_snapshots_shipping_sane",
+          "value": "\"active_market_snapshots\".\"asking_shipping\" IS NULL OR (\"active_market_snapshots\".\"asking_shipping\" >= 0 AND \"active_market_snapshots\".\"asking_shipping\" <= 1000000)"
+        },
+        "active_snapshots_qty_nonneg": {
+          "name": "active_snapshots_qty_nonneg",
+          "value": "\"active_market_snapshots\".\"active_qty\" IS NULL OR \"active_market_snapshots\".\"active_qty\" >= 0"
+        },
+        "active_snapshots_sample_nonneg": {
+          "name": "active_snapshots_sample_nonneg",
+          "value": "\"active_market_snapshots\".\"sample_size\" IS NULL OR \"active_market_snapshots\".\"sample_size\" >= 0"
+        }
+      },
+      "isRLSEnabled": false
+    }
+  },
+  "enums": {
+    "public.period": {
+      "name": "period",
+      "schema": "public",
+      "values": [
+        "1yr",
+        "6m",
+        "90d",
+        "30d",
+        "7d"
+      ]
+    },
+    "public.snapshot_source": {
+      "name": "snapshot_source",
+      "schema": "public",
+      "values": [
+        "manual",
+        "ebay_browse",
+        "ebay_insights"
+      ]
+    },
+    "public.sync_status": {
+      "name": "sync_status",
+      "schema": "public",
+      "values": [
+        "running",
+        "success",
+        "partial",
+        "failed"
+      ]
+    },
+    "public.price_basis": {
+      "name": "price_basis",
+      "schema": "public",
+      "values": [
+        "unknown",
+        "sold",
+        "asking"
+      ]
+    }
+  },
+  "schemas": {},
+  "sequences": {},
+  "roles": {},
+  "policies": {},
+  "views": {},
+  "_meta": {
+    "columns": {},
+    "schemas": {},
+    "tables": {}
+  }
+}

@@ -1,288 +1,274 @@
-# EbayDecisions
+# EbayDecisions — canonical rebuild
 
-Appliance parts market tracker and listing decision engine for Road Runner Appliance.
+Internal appliance-parts market tracker and eBay listing decision engine for Road Runner Appliance.
 
-Tracks what each MPN in stock is fetching on eBay across five lookback windows, works out
-what you would actually net after fees and shipping, and tells you what to do with it:
-**list now, list, hold, watch,** or **dump** — with the numbers behind every call.
+**Stack:** Next.js 16 App Router · React 19 · Neon Postgres · Drizzle · Recharts · Vercel.
 
-Next.js 16 · Neon Postgres · Drizzle · Vercel.
+This rebuild uses the original EbayDecisions project as the engineering chassis and incorporates the corrected market model developed during the review session. It intentionally keeps the strong parts of the original project—Drizzle migrations, surrogate part IDs, CRUD, CSV import/export, HMAC sessions, database constraints, PGlite integration tests, sync auditing and eBay adapter orchestration—while replacing the ambiguous quantity/trend/autosave behavior.
 
----
+## Product rules that are now binding
 
-## What changed from the prototype
+### 1. Sold demand and active competition are different data
 
-This began as a Figma Make prototype: one 875-line `App.tsx`, 63 hard-coded MPNs, and market
-data in `localStorage`. The shape of the thing was right. What it could not do was survive a
-cleared browser, be opened from a second device, or tell you anything you had not typed in
-yourself.
+`market_snapshots` stores the five **sold-market lookback aggregates**:
 
-The substantive changes:
+- 1 year
+- 6 months
+- 90 days
+- 30 days
+- 7 days
 
-**Market data is append-only.** Every reading is kept. The spreadsheet held one number per
-window — "the 30-day comp is $104." This holds the history of that number, so you can see it
-slid from $118 to $104 over six weeks. Trends are computed from real movement rather than
-asserted. The "current" grid is just the newest row per window, read with a single
-`DISTINCT ON`.
+Each row may contain item price, buyer-paid shipping, **sold quantity**, price basis, source, sample size and capture time.
 
-**No invented data.** The prototype seeded the grid with randomly generated prices so the
-charts had something to draw. In a tool you price inventory from, a fabricated comp is worse
-than an empty cell: an empty cell tells you to go look, a fabricated one tells you a lie with
-a chart attached. Every figure here comes from an eBay sync or from you.
+`active_market_snapshots` is a separate append-only stream for **point-in-time active competition**:
 
-**Sold comps and asking prices are never mixed silently.** See [eBay data](#ebay-data).
+- median asking price
+- median buyer-paid shipping
+- active listing count
+- sample / qualification metadata
+- capture time
 
-**It computes decisions, not just trends.** See [the decision engine](#the-decision-engine).
+An active listing count is never stored as sold quantity, and sold volume is never interpreted as competing supply.
 
----
+### 2. Historical trend means actual elapsed time
 
-## Setup
+The five lookback windows are nested aggregates; they are not five equally spaced historical observations.
 
-### 1. Neon
+The app therefore has two distinct readings:
 
-Create a project at [neon.tech](https://neon.tech). From **Connect**, copy the **pooled**
-connection string — the one with `-pooler` in the host. Pooled is what you want on serverless;
-the direct string runs out of connections under load.
+- **Current-window curve:** context across 365 / 182 / 90 / 30 / 7-day aggregates using their real spacing.
+- **Historical trend:** repeated observations of the same metric across real `captured_at` dates.
 
-### 2. Environment
+Only the historical trend can influence timing recommendations. It must have:
 
-Copy `.env.example` to `.env.local` and fill it in:
+- at least **3 distinct UTC capture dates**, and
+- at least **14 days** from first to last.
 
-```bash
-cp .env.example .env.local
-openssl rand -base64 48   # AUTH_SECRET
-openssl rand -hex 32      # CRON_SECRET
+Multiple corrections on the same UTC day remain in the append-only audit table, but trend math collapses that day to the latest reading so a correction made minutes later cannot become a huge extrapolated “30-day trend.”
+
+### 3. Demand fallback is units per day
+
+Until longitudinal demand history matures, unequal sold windows are compared as sales velocity:
+
+```text
+sold velocity = sold_qty / window_days
 ```
 
-`DATABASE_URL`, `APP_PASSWORD` and `AUTH_SECRET` are required. Everything else is optional.
+So 8 sold in 7 days is correctly stronger demand than 20 sold in 30 days, even though the raw count is smaller.
 
-### 3. Tables and seed data
+### 4. Explicit Save MPN; no autosave
 
-```bash
-pnpm install
-pnpm db:migrate   # creates the tables
-pnpm db:seed      # loads the 63 MPNs from the spreadsheet
-pnpm dev
-```
+The tracker does **not** persist on keystrokes, blur or timers.
 
-The seed loads part numbers, descriptions, quantities and reference URLs. It does **not** load
-cost bases — only you know what each unit cost. Until a part has one, the board reports
-"needs data" for it rather than guessing.
+- edit any fields locally
+- optionally preview eBay Active data
+- press **Save MPN**
 
-Fastest way to load 63 costs: Settings → Export CSV, fill in the `cost_basis` column in a
-spreadsheet, then Settings → Import. Import matches on MPN and only touches the columns your
-file contains.
+Only fields touched in the browser are submitted. The database statement reads the live latest values and carries untouched fields forward, so an eBay sync that landed after the page loaded is not overwritten by stale browser state.
 
-### 4. Deploy to Vercel
+One Save MPN is one Postgres statement for all touched sold windows plus the active-market patch. Raw history remains append-only.
 
-Import `vlad40000/EbayDecisions` at [vercel.com/new](https://vercel.com/new). Add the same
-environment variables under **Settings → Environment Variables** (all environments), then
-deploy.
+There is no polling or heartbeat.
 
-`vercel.json` registers a daily eBay sync at 08:00 UTC. It calls `/api/cron/sync` with
-`CRON_SECRET` as a bearer token; without that variable set the route refuses every request
-rather than defaulting open.
+### 5. eBay Browse is a preview of active asking prices
 
-Run the migration against production once:
+The Tracker's **Preview eBay Active** button:
 
-```bash
-DATABASE_URL="<your neon pooled url>" pnpm db:migrate
-DATABASE_URL="<your neon pooled url>" pnpm db:seed
-```
+- runs only on user request
+- performs no Neon write
+- filters the search to used items
+- requires an exact normalized MPN title match
+- rejects longer substring matches such as `W112045170` for `W11204517`
+- records how many broad results were rejected
+- withholds active quantity when the eBay result set is truncated rather than silently saving an undercount
 
----
+Preview values only become persistent after **Save MPN**.
 
-## The decision engine
+### 6. Marketplace Insights is a sold-data adapter, when authorized
 
-Everything lives in `src/lib/decisions.ts`. It is plain functions over plain data, with no
-database or framework in it, which is what makes it straightforward to test — and it is
-tested, against hand-computed figures.
+With `EBAY_ADAPTER=auto`, the sync probes Marketplace Insights first and falls back to Browse if the account cannot use it.
 
-### The economics
+Insights writes only sold-window observations. Browse writes only point-in-time active-market observations. The sync audit records which adapter actually ran and separate sold/active write counts.
 
-eBay's final value fee applies to the **whole order**, item plus the shipping the buyer pays.
-A model that fees only the item price overstates margin on everything, and overstates it most
-on the heavy parts where shipping is largest.
+If an Insights response exposes titles for all returned sales, exact-MPN filtering is applied. If the API response does not expose enough title metadata to verify that boundary, the sync records that limitation instead of claiming verification it did not perform. Truncated sales samples keep their median sample price but leave sold quantity unknown rather than storing a known undercount.
 
-```
-grossOrder  = price + shipping          what the buyer pays
-fees        = grossOrder × feePct + feeFixed
-netProceeds = grossOrder − fees − yourShipCost
+## Decision engine
+
+The economics remain deliberately simple and auditable:
+
+```text
+grossOrder  = itemPrice + buyerShipping
+fees        = grossOrder × feePct + fixedFee
+netProceeds = grossOrder − fees − actualShipCost
 margin$     = netProceeds − costBasis
 margin%     = margin$ / netProceeds
 ```
 
-A cost basis of `0` is real and common — a board pulled off a scrapped machine has no marginal
-cost — and is treated as different from a blank one. Blank means unknown and blocks the
-margin maths; zero means free and yields 100% margin.
+A cost basis of `0` is valid and distinct from an unknown/null cost basis.
 
-The five assumptions (fee %, fixed fee, default ship cost, target margin, margin floor) live
-in the database and are edited on the Settings page, so changing one re-reads the whole board
-without a redeploy.
+Settings are editable in the app:
 
-### The trends
+- eBay percentage fee
+- eBay fixed fee
+- default actual shipping cost
+- target margin
+- minimum margin floor
 
-Least-squares slope across the five windows, oldest to newest, normalised by the series mean
-so a $2/window move on a $30 gasket is comparable to $2/window on a $200 board. Missing
-windows keep their original spacing — a part missing its 6-month reading does not get a
-falsely steep slope from having its remaining points bunched together.
+The suggested list price is solved backwards through the same fee model to hit the selected target margin.
 
-Under 2%/window reads as flat; 6% or more reads as strong.
+Timing rules use qualified historical signals only. A current-window curve is visible for context but cannot by itself force `LIST_NOW`, `HOLD` or `DUMP` based on trend.
 
-### The rules
+## Data migration
 
-Evaluated in order, first match wins. The ordering *is* the priority: losing money outranks a
-thin margin, which outranks a healthy one.
+Migration `0002_market_semantics.sql` converts the original overloaded `qty` model safely:
 
-| Verdict | When |
-|---|---|
-| **Needs data** | No comps, or no cost basis |
-| **Dump** | Margin is negative |
-| **Dump** | Margin under the floor **and** market falling |
-| **Hold** | Margin under the floor **but** market rising |
-| **Watch** | Margin under the floor, market flat |
-| **List now** | Margin at/above target **and** market falling — take it before it erodes |
-| **List now** | Margin at/above target **and** competing supply climbing fast |
-| **Hold** | Margin at/above target **and** market climbing hard — waiting earns more |
-| **List** | Margin at/above target, stable market |
-| **Hold / List / Watch** | Between floor and target, by trend direction |
+- old `ebay_insights.qty` → `sold_qty`
+- old `ebay_browse` rows → `active_market_snapshots`
+- old manual `qty` stays in `legacy_qty` for audit because its meaning cannot be inferred safely
+- old Browse rows are removed from sold-window history after being copied to active-market history
 
-Each verdict carries the sentence that produced it, with its numbers. It also gives a
-**suggested list price** — the item price that hits your target margin at the observed
-shipping, solved backwards through the fee model. A recommendation you cannot audit is one you
-should not follow.
+The migration never guesses whether an ambiguous manual legacy quantity meant sold units or active listings.
 
----
+## Neon compute discipline
 
-## eBay data
+The app is designed to avoid unnecessary Neon compute:
 
-The app is fully usable with no eBay credentials at all: you type the comps, it does the
-maths, exactly as the spreadsheet did. Credentials add syncing on top.
+- lazy database connection
+- no database work before an authenticated request needs it
+- no autosave (market tracker or inventory economics)
+- inventory rows use explicit **Save Part**; market rows use explicit **Save MPN**
+- no client polling / heartbeat
+- one explicit Save MPN statement
+- eBay active preview does not touch Neon
+- scheduled eBay sync is **off by default**
 
-Set `EBAY_CLIENT_ID` and `EBAY_CLIENT_SECRET` from
-[developer.ebay.com](https://developer.ebay.com) → My Account → Application Keys.
+`vercel.json` retains the cron definition so it can be enabled later, but `/api/cron/sync` returns before reading from Neon unless:
 
-There are two adapters, and the difference between them matters more than anything else in
-this README:
+```text
+EBAY_CRON_ENABLED=true
+```
 
-| Adapter | What it sees | Requires |
-|---|---|---|
-| **Marketplace Insights** | Real **sold** comps, last 90 days | eBay to approve the `buy.marketplace.insights` scope for your app |
-| **Browse** | **Active listings** — asking prices and how many sellers you are up against | Nothing beyond standard keys |
+When enabled, `CRON_SECRET` is also required.
 
-An unsold listing at $200 is evidence of one seller's optimism, not of what the part fetches.
-So:
+## Charts
 
-- Every stored reading records which adapter produced it.
-- The UI labels them "Sold comps" and "Active listings" wherever a number appears.
-- A part whose entire read rests on asking prices is flagged on the board and in its detail.
+Part detail pages separate the meanings visually:
 
-With `EBAY_ADAPTER=auto` (the default) the sync tries Insights and falls back to Browse if the
-scope is not granted, recording which one actually ran in the sync log on the Settings page.
+- **Area + fitted line:** current sold-window buyer-total curve using true lookback spacing; context only
+- **Stacked bar:** item price vs buyer-paid shipping
+- **Bar:** sold velocity in units/day
+- **Calendar line:** repeated sold-price observations over actual capture dates
+- **Calendar bar:** point-in-time active-listing competition over actual capture dates
 
-**The 6-month and 1-year windows cannot be synced.** Insights reaches back 90 days and no eBay
-API goes further. Those two windows fill in by hand, or they accumulate as this app keeps
-taking readings. Nothing here invents them.
+No random market prices are seeded.
 
----
+## Inventory and data operations
+
+The stronger original workflows are preserved:
+
+- add / edit / delete parts
+- active / inactive inventory
+- MPN is unique business data; internal relationships use surrogate `part_id`
+- CSV bulk import
+- full CSV export with sold/active fields and decision metadata
+- 63-part seed catalogue, idempotent by MPN
+- sync-run audit log
+
+## Authentication
+
+`APP_PASSWORD` is the shared sign-in password. `AUTH_SECRET` independently HMAC-signs a session payload containing its expiration time. `proxy.ts` handles page navigation, and server actions/routes re-check the session at the data boundary.
+
+Changing `AUTH_SECRET` invalidates existing sessions.
+
+## Setup
+
+```bash
+cp .env.example .env.local
+pnpm install
+pnpm db:migrate
+pnpm db:seed
+pnpm verify
+pnpm dev
+```
+
+Required:
+
+```text
+DATABASE_URL
+APP_PASSWORD
+AUTH_SECRET
+```
+
+Optional eBay and cron variables are documented in `.env.example`.
+
+## Vercel
+
+1. Create/import the GitHub repository in Vercel.
+2. Add `DATABASE_URL`, `APP_PASSWORD`, and `AUTH_SECRET` to the intended environments.
+3. Add eBay variables only if sync/preview is wanted.
+4. Leave `EBAY_CRON_ENABLED=false` until scheduled sync is intentionally enabled.
+5. Run the production migrations and seed once against the chosen Neon database.
+6. Let CI and Vercel build the same committed source.
+
+## Verification
+
+```bash
+pnpm verify
+```
+
+runs:
+
+1. ESLint
+2. TypeScript
+3. Vitest
+4. production Next.js build
+
+The query integration tests run the real migration SQL and query layer against PGlite/Postgres semantics, including the sold/active split, legacy migration behavior, explicit-save carry-forward, constraints and historical trend qualification.
 
 ## Layout
 
-```
-proxy.ts                  session gate for page routes (Next 16 renamed middleware → proxy)
-drizzle/                  generated migrations
+```text
+proxy.ts
+vercel.json
+.github/workflows/ci.yml
+
+drizzle/
+  0000_*.sql
+  0001_*.sql
+  0002_market_semantics.sql
+
 src/
-  app/
-    (app)/                the signed-in application
-      decisions/          the board — what to do, ordered by what is at stake
-      inventory/          catalogue with inline cost-basis editing
-      inventory/[mpn]/    one part: recommendation, economics, charts, history
-      tracker/            comps entry grid, saves as you type
-      settings/           fee assumptions, eBay status, sync log, import/export
-    api/
-      cron/sync/          scheduled sync — CRON_SECRET bearer token
-      ebay/sync/          manual sync
-      parts/import|export CSV in and out
-  components/             UI; charts in part-charts.tsx
+  app/(app)/
+    decisions/
+    inventory/
+    inventory/[mpn]/
+    tracker/
+    settings/
+  app/api/
+    cron/sync/
+    ebay/preview/[mpn]/
+    ebay/sync/
+    parts/import/
+    parts/export/
+  components/
   db/
-    schema.ts             parts · market_snapshots · settings · ebay_sync_runs
-    queries.ts            data access, including the latest-per-window read
+    schema.ts
+    queries.ts
+    seed-data.ts
+    seed.ts
   lib/
-    decisions.ts          the engine
-    stats.ts              least-squares trend, median
-    ebay/                 OAuth client, browse + insights adapters, sync orchestrator
-    auth.ts               HMAC session tokens
-tests/                    engine unit tests + query integration tests
+    decisions.ts
+    stats.ts
+    auth.ts
+    session.ts
+    ebay/
+      browse.ts
+      insights.ts
+      match.ts
+      sync.ts
+
+tests/
+  decisions.test.ts
+  ebay-match.test.ts
+  queries.test.ts
 ```
-
-### Notes on a few choices
-
-**Auth is a shared password**, signed into an HTTP-only cookie with an HMAC over its own
-expiry — so a client cannot extend its session by editing the cookie. `proxy.ts` redirects
-unauthenticated page loads, but that is a convenience, not the boundary: middleware does not
-protect a server action reachable by direct POST, so every action and route handler re-checks
-the session where it touches data.
-
-**Neon over HTTP** (`drizzle-orm/neon-http`): one fetch per query, no pool to exhaust. It has
-no interactive transactions, and nothing here needs one.
-
-**The database handle connects lazily.** `next build` imports every route's module graph, so a
-top-level connect would fail the build on a machine with no `DATABASE_URL`. Deferring it means
-a missing variable shows up as a banner in the running app instead.
-
-**Neon compute is treated as something you pay for.** It bills by active time and autosuspends
-when idle, so the app never wakes it without cause: nothing polls, nothing runs on a heartbeat,
-no query happens before a visitor is authenticated, and the signed-in layout does no data
-access at all — each page loads its own data, so one page load is one query. The only scheduled
-work is the daily eBay sync.
-
-**The tracker autosaves, but batches by part.** Filling a part's five windows means typing into
-fifteen cells; sending one request per cell would be fifteen round-trips for one part, and
-~945 to fill the catalogue. Edits are collected per part and flushed together — after a short
-pause, on Enter, or when focus leaves that part — so fifteen cells cost one request, which the
-query layer turns into at most three statements. There is no Save button to forget and nothing
-is lost if you wander off; a tab closed inside that one-second window gets a confirm prompt.
-(Blur is handled on the part's container, not per input: on each input, moving between cells
-fires a save every time and the batching buys nothing. That regression is what the counts in
-the verification below were written to catch.)
-
-**Server modules are fenced off with `server-only`.** `src/db/*`, `src/lib/auth.ts`,
-`src/lib/session.ts` and the eBay client import it, so pulling any of them into a client bundle
-is a build error rather than a leaked connection string.
-
-**Constraints live in the database too, not only in Zod.** The app is not the only writer — the
-seed script, the CSV importer and a psql session all reach these tables — so ranges are enforced
-in Postgres as well: non-negative quantities, cost and price ceilings, margins under 100%, a
-margin floor that cannot exceed the target, and a single settings row.
-
-**Charts are not zero-baselined.** Bars are — length is the encoding there. Lines are fitted to
-the data range, because position is the encoding and a forced zero baseline flattens a real
-28% move into a straight line. The series palette is validated for colour-vision deficiency
-and deliberately avoids the app's green/red status hues, so a shipping-cost bar never looks
-like a verdict.
-
----
-
-## Commands
-
-```bash
-pnpm dev            # dev server
-pnpm verify         # typecheck + tests + production build
-pnpm test           # tests only
-pnpm lint
-pnpm db:generate    # new migration from a schema change
-pnpm db:migrate     # apply migrations
-pnpm db:seed        # load the parts catalogue (idempotent)
-pnpm db:studio      # browse the data
-```
-
-### Tests
-
-`tests/decisions.test.ts` checks the engine against hand-computed figures: the fee base, the
-zero-versus-blank cost basis, and a round-trip proving the suggested list price actually
-produces the target margin.
-
-`tests/queries.test.ts` runs the real SQL against Postgres compiled to WebAssembly, in
-process. It applies the same generated migration that runs against Neon — so it also proves
-the migration applies cleanly — then exercises the `DISTINCT ON` read, the snapshot
-coalescing, the carry-forward of untouched fields, and the cascade delete.

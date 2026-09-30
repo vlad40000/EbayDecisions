@@ -15,6 +15,13 @@
       "when": 1790790047644,
       "tag": "0001_talented_king_cobra",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1790791000000,
+      "tag": "0002_market_semantics",
+      "breakpoints": true
     }
   ]
 }

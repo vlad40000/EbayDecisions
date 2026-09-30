@@ -1,23 +1,7 @@
-import { linearTrend, type Trend } from './stats'
-import {
-  PERIODS,
-  SOURCE_IS_SOLD,
-  type EconomicSettings,
-  type Period,
-  type PartWithMarket,
-} from './types'
+import { PERIOD_DAYS, PERIODS, type EconomicSettings, type PartWithMarket, type Period, type TrendBasis, type TrendSummary } from './types'
+import { spacedWindowTrend, type TrendDirection } from './stats'
 
 export type Action = 'LIST_NOW' | 'LIST' | 'HOLD' | 'WATCH' | 'DUMP' | 'NEEDS_DATA'
-
-/** Sort order for the board: the things you should act on first come first. */
-export const ACTION_PRIORITY: Record<Action, number> = {
-  LIST_NOW: 0,
-  DUMP: 1,
-  LIST: 2,
-  WATCH: 3,
-  HOLD: 4,
-  NEEDS_DATA: 5,
-}
 
 export const ACTION_LABELS: Record<Action, string> = {
   LIST_NOW: 'List now',
@@ -28,56 +12,52 @@ export const ACTION_LABELS: Record<Action, string> = {
   NEEDS_DATA: 'Needs data',
 }
 
-/** Per-unit economics at one window's observed market. */
+export const ACTION_PRIORITY: Record<Action, number> = {
+  LIST_NOW: 0,
+  DUMP: 1,
+  LIST: 2,
+  WATCH: 3,
+  HOLD: 4,
+  NEEDS_DATA: 5,
+}
+
 export type Economics = {
-  /** Item price the comps show. */
   price: number
-  /** Shipping the buyer pays, per the comps. */
   shipping: number
-  /** Total the buyer pays — this is what eBay charges fees on. */
   grossOrder: number
-  /** eBay final value fee plus the fixed per-order fee. */
   fees: number
-  /** What it costs you to ship it. */
   shipCost: number
-  /** What lands in your pocket before cost of goods. */
   netProceeds: number
-  /** netProceeds minus cost basis. NULL when cost basis is unknown. */
   marginDollars: number | null
-  /** Margin as a percent of net proceeds. NULL when cost basis is unknown. */
   marginPct: number | null
-  /** Return on cost. NULL when cost basis is unknown or zero. */
   roiPct: number | null
+}
+
+export type TrendRead = {
+  direction: TrendDirection
+  pctPer30d: number | null
+  points: number
+  spanDays: number
+  strong: boolean
+  basis: TrendBasis
+  period: Period | null
 }
 
 export type Decision = {
   action: Action
-  /** One sentence, with the numbers that drove it. */
   reason: string
-  /** Supporting observations, most important first. */
   notes: string[]
   economics: Economics | null
-  costTrend: Trend
-  supplyTrend: Trend
-  /** Target used, after any per-part override. */
-  targetMarginPct: number
-  /** What to list at to hit the target margin. NULL without a cost basis. */
   suggestedListPrice: number | null
-  /** marginDollars times units on hand — how much is actually at stake. */
   potentialDollars: number | null
-  /** True when the read rests on asking prices rather than sold comps. */
-  askingPricesOnly: boolean
-  /** True when fewer than 3 windows have data. */
-  thinData: boolean
+  marketTrend: TrendRead
+  demandTrend: TrendRead
+  supplyTrend: TrendRead
+  targetMarginPct: number
+  provenance: 'sold' | 'asking' | 'mixed' | 'unknown'
+  currentMarketKind: 'window' | 'active' | 'none'
 }
 
-/**
- * Per-unit economics for a listing at the given price and shipping.
- *
- * eBay's final value fee applies to the whole order — item plus the shipping the
- * buyer pays — which is why `grossOrder` and not `price` is the fee base. A
- * model that fees only the item price systematically overstates margin.
- */
 export function computeEconomics(args: {
   price: number
   shipping: number
@@ -85,26 +65,21 @@ export function computeEconomics(args: {
   shipCost: number | null
   settings: EconomicSettings
 }): Economics {
-  const { price, shipping, costBasis, settings } = args
-  const shipCost = args.shipCost ?? settings.defaultShipCost
-
-  const grossOrder = price + shipping
-  const fees = grossOrder * (settings.feePct / 100) + settings.feeFixed
+  const shipCost = args.shipCost ?? args.settings.defaultShipCost
+  const grossOrder = args.price + args.shipping
+  const fees = grossOrder * (args.settings.feePct / 100) + args.settings.feeFixed
   const netProceeds = grossOrder - fees - shipCost
-
-  // costBasis of 0 is real and common — a part pulled off a scrapped machine.
-  // Only null means "unknown", and only null blocks the margin math.
-  const marginDollars = costBasis == null ? null : netProceeds - costBasis
+  const marginDollars = args.costBasis == null ? null : netProceeds - args.costBasis
   const marginPct =
     marginDollars == null || netProceeds <= 0 ? null : (marginDollars / netProceeds) * 100
   const roiPct =
-    marginDollars == null || costBasis == null || costBasis <= 0
+    marginDollars == null || args.costBasis == null || args.costBasis <= 0
       ? null
-      : (marginDollars / costBasis) * 100
+      : (marginDollars / args.costBasis) * 100
 
   return {
-    price,
-    shipping,
+    price: args.price,
+    shipping: args.shipping,
     grossOrder,
     fees,
     shipCost,
@@ -115,14 +90,6 @@ export function computeEconomics(args: {
   }
 }
 
-/**
- * The item price that hits `targetMarginPct` on net proceeds, given the shipping
- * you intend to charge.
- *
- * Solving netProceeds = cost / (1 - m) for price:
- *   netProceeds = (price + shipping)(1 - f) - feeFixed - shipCost
- *   price = [cost/(1 - m) + feeFixed + shipCost] / (1 - f) - shipping
- */
 export function suggestedListPrice(args: {
   costBasis: number | null
   shipping: number
@@ -130,17 +97,15 @@ export function suggestedListPrice(args: {
   targetMarginPct: number
   settings: EconomicSettings
 }): number | null {
-  const { costBasis, shipping, targetMarginPct, settings } = args
-  if (costBasis == null) return null
+  if (args.costBasis == null) return null
+  const margin = args.targetMarginPct / 100
+  const fee = args.settings.feePct / 100
+  if (margin >= 1 || fee >= 1) return null
 
-  const m = targetMarginPct / 100
-  const f = settings.feePct / 100
-  if (m >= 1 || f >= 1) return null
-
-  const shipCost = args.shipCost ?? settings.defaultShipCost
-  const requiredNet = costBasis / (1 - m)
-  const price = (requiredNet + settings.feeFixed + shipCost) / (1 - f) - shipping
-
+  const shipCost = args.shipCost ?? args.settings.defaultShipCost
+  const requiredNet = args.costBasis / (1 - margin)
+  const price =
+    (requiredNet + args.settings.feeFixed + shipCost) / (1 - fee) - args.shipping
   return price > 0 ? price : null
 }
 
@@ -149,59 +114,158 @@ function totalCost(observation: { price: number | null; shipping: number | null 
   return observation.price + (observation.shipping ?? 0)
 }
 
+function directionFromPct(pct: number | null): TrendDirection {
+  if (pct == null) return 'unknown'
+  if (Math.abs(pct) < 2) return 'flat'
+  return pct > 0 ? 'rising' : 'falling'
+}
+
+function historicalRead(args: {
+  pctPer30d: number | null
+  points: number
+  spanDays: number
+  period?: Period | null
+}): TrendRead {
+  const qualified = args.points >= 3 && args.spanDays >= 14 && args.pctPer30d != null
+  return {
+    direction: qualified ? directionFromPct(args.pctPer30d) : 'unknown',
+    pctPer30d: args.pctPer30d,
+    points: args.points,
+    spanDays: args.spanDays,
+    strong: qualified && Math.abs(args.pctPer30d ?? 0) >= 6,
+    basis: qualified ? 'history' : 'insufficient',
+    period: args.period ?? null,
+  }
+}
+
+function marketWindowCurve(part: PartWithMarket): TrendRead {
+  const trend = spacedWindowTrend(
+    PERIODS.map((period) => ({
+      daysAgo: PERIOD_DAYS[period],
+      value: part.periods[period] ? totalCost(part.periods[period]!) : null,
+    })),
+  )
+  return {
+    direction: trend.direction,
+    pctPer30d: trend.pctPer30d,
+    points: trend.points,
+    spanDays: trend.spanDays,
+    strong: trend.strong,
+    basis: trend.points >= 2 ? 'window-curve' : 'insufficient',
+    period: null,
+  }
+}
+
 /**
- * Turns a part's market history into a recommendation.
- *
- * Rules are evaluated in order and the first match wins, so the ordering encodes
- * the priority: losing money outranks a thin margin, which outranks a healthy
- * one. Every branch states the numbers behind it, because a recommendation you
- * cannot audit is a recommendation you should not follow.
+ * Demand fallback compares sales velocity, not raw nested-window counts.
+ * 8 sales in 7 days is stronger demand than 20 in 30 days, even though 8 < 20.
  */
-export function decide(part: PartWithMarket, settings: EconomicSettings): Decision {
-  const target = part.targetMarginPct ?? settings.targetMarginPct
-  const min = settings.minMarginPct
+function demandWindowVelocity(part: PartWithMarket): TrendRead {
+  const trend = spacedWindowTrend(
+    PERIODS.map((period) => ({
+      daysAgo: PERIOD_DAYS[period],
+      value:
+        part.periods[period]?.soldQty == null
+          ? null
+          : part.periods[period]!.soldQty! / PERIOD_DAYS[period],
+    })),
+  )
+  return {
+    direction: trend.direction,
+    pctPer30d: trend.pctPer30d,
+    points: trend.points,
+    spanDays: trend.spanDays,
+    strong: trend.strong,
+    basis: trend.points >= 2 ? 'window-velocity' : 'insufficient',
+    period: null,
+  }
+}
 
-  const costSeries = PERIODS.map((p) => {
-    const observation = part.periods[p]
-    return observation ? totalCost(observation) : null
-  })
-  const qtySeries = PERIODS.map((p) => part.periods[p]?.qty ?? null)
+function provenance(part: PartWithMarket): Decision['provenance'] {
+  const bases = PERIODS.map((period) => part.periods[period])
+    .filter((observation) => observation?.price != null)
+    .map((observation) => observation!.priceBasis)
 
-  const costTrend = linearTrend(costSeries)
-  const supplyTrend = linearTrend(qtySeries)
+  if (bases.length === 0 && part.activeMarket?.askingPrice != null) return 'asking'
+  const known = bases.filter((basis) => basis !== 'unknown')
+  if (known.length === 0) return bases.length > 0 ? 'unknown' : 'unknown'
+  const unique = new Set(known)
+  if (unique.size > 1 || bases.includes('unknown')) return 'mixed'
+  return unique.has('sold') ? 'sold' : 'asking'
+}
 
-  const windowsWithData = costSeries.filter((v) => v != null).length
-  const thinData = windowsWithData > 0 && windowsWithData < 3
-
-  // The most recent window with a price is what we price against today.
-  let current: { period: Period; price: number; shipping: number } | null = null
+function currentMarket(part: PartWithMarket): {
+  price: number
+  shipping: number
+  kind: 'window' | 'active'
+} | null {
   for (let i = PERIODS.length - 1; i >= 0; i -= 1) {
-    const period = PERIODS[i] as Period
-    const observation = part.periods[period]
+    const observation = part.periods[PERIODS[i] as Period]
     if (observation?.price != null) {
-      current = { period, price: observation.price, shipping: observation.shipping ?? 0 }
-      break
+      return {
+        price: observation.price,
+        shipping: observation.shipping ?? 0,
+        kind: 'window',
+      }
     }
   }
 
-  const sourcesSeen = PERIODS.map((p) => part.periods[p]?.source).filter(
-    (s): s is NonNullable<typeof s> => s != null,
-  )
-  const askingPricesOnly = sourcesSeen.length > 0 && sourcesSeen.every((s) => !SOURCE_IS_SOLD[s])
+  if (part.activeMarket?.askingPrice != null) {
+    return {
+      price: part.activeMarket.askingPrice,
+      shipping: part.activeMarket.askingShipping ?? 0,
+      kind: 'active',
+    }
+  }
+  return null
+}
 
+export function decide(
+  part: PartWithMarket,
+  settings: EconomicSettings,
+  summary?: TrendSummary,
+): Decision {
+  const target = part.targetMarginPct ?? settings.targetMarginPct
+  const min = settings.minMarginPct
+
+  const historyMarket = historicalRead({
+    pctPer30d: summary?.marketPctPer30d ?? null,
+    points: summary?.marketPoints ?? 0,
+    spanDays: summary?.marketSpanDays ?? 0,
+    period: summary?.marketPeriod ?? null,
+  })
+  const marketTrend = historyMarket.basis === 'history' ? historyMarket : marketWindowCurve(part)
+
+  const historyDemand = historicalRead({
+    pctPer30d: summary?.demandPctPer30d ?? null,
+    points: summary?.demandPoints ?? 0,
+    spanDays: summary?.demandSpanDays ?? 0,
+    period: summary?.demandPeriod ?? null,
+  })
+  const demandTrend = historyDemand.basis === 'history' ? historyDemand : demandWindowVelocity(part)
+
+  const supplyTrend = historicalRead({
+    pctPer30d: summary?.supplyPctPer30d ?? null,
+    points: summary?.supplyPoints ?? 0,
+    spanDays: summary?.supplySpanDays ?? 0,
+  })
+
+  const current = currentMarket(part)
+  const readProvenance = provenance(part)
   const base = {
-    costTrend,
+    marketTrend,
+    demandTrend,
     supplyTrend,
     targetMarginPct: target,
-    askingPricesOnly,
-    thinData,
+    provenance: readProvenance,
+    currentMarketKind: current?.kind ?? ('none' as const),
   }
 
   if (!current) {
     return {
       ...base,
       action: 'NEEDS_DATA',
-      reason: 'No market data yet — run a sync or enter comps in the Tracker.',
+      reason: 'No market price data yet — enter a sold comp or preview active eBay listings.',
       notes: [],
       economics: null,
       suggestedListPrice: null,
@@ -216,7 +280,6 @@ export function decide(part: PartWithMarket, settings: EconomicSettings): Decisi
     shipCost: part.shipCost,
     settings,
   })
-
   const suggested = suggestedListPrice({
     costBasis: part.costBasis,
     shipping: current.shipping,
@@ -226,132 +289,149 @@ export function decide(part: PartWithMarket, settings: EconomicSettings): Decisi
   })
 
   const notes: string[] = []
-  if (thinData) {
-    notes.push(`Only ${windowsWithData} of 5 windows have data — trend read is weak.`)
+  if (marketTrend.basis !== 'history') {
+    if (marketTrend.basis === 'window-curve') {
+      notes.push('Historical captures are not mature yet; the shown price direction is only the current lookback-window curve and does not drive the verdict.')
+    } else {
+      notes.push('Price history needs at least 3 distinct capture dates spanning 14 days before it can drive a verdict.')
+    }
   }
-  if (askingPricesOnly) {
-    notes.push('Based on active-listing asking prices, not sold comps.')
+  if (demandTrend.basis === 'window-velocity') {
+    notes.push('Demand history is not mature yet; the fallback compares sold units per day across the unequal lookback windows.')
+  }
+  if (supplyTrend.basis !== 'history') {
+    notes.push('Competitive-supply trend needs at least 3 active-listing captures spanning 14 days.')
+  }
+  if (readProvenance === 'asking' || current.kind === 'active') {
+    notes.push('Current economics use active-listing asking prices, not completed sales.')
+  } else if (readProvenance === 'mixed') {
+    notes.push('The visible price windows mix sold, asking, or unknown-basis observations.')
+  } else if (readProvenance === 'unknown') {
+    notes.push('At least one manual price has an unknown sold/asking basis.')
   }
   if (part.shipCost == null) {
-    notes.push(`Using the default $${settings.defaultShipCost.toFixed(2)} ship cost.`)
+    notes.push(`Using the default $${settings.defaultShipCost.toFixed(2)} actual ship cost.`)
   }
-  if (supplyTrend.direction === 'rising' && supplyTrend.strong) {
-    notes.push(`Competing supply up ${Math.abs(supplyTrend.pctPerPeriod ?? 0).toFixed(1)}%/window.`)
+  if (supplyTrend.basis === 'history' && supplyTrend.strong && supplyTrend.direction === 'rising') {
+    notes.push(`Active competing supply is rising ${Math.abs(supplyTrend.pctPer30d ?? 0).toFixed(1)}% per 30 days.`)
   }
-  if (supplyTrend.direction === 'falling' && supplyTrend.strong) {
-    notes.push(
-      `Competing supply down ${Math.abs(supplyTrend.pctPerPeriod ?? 0).toFixed(1)}%/window.`,
-    )
+  if (demandTrend.basis === 'history' && demandTrend.strong && demandTrend.direction === 'rising') {
+    notes.push(`Sold velocity is rising ${Math.abs(demandTrend.pctPer30d ?? 0).toFixed(1)}% per 30 days.`)
   }
 
-  const { marginDollars, marginPct } = economics
+  const marginDollars = economics.marginDollars
+  const marginPct = economics.marginPct
   const potentialDollars = marginDollars == null ? null : marginDollars * part.inventoryQty
-  const result = { ...base, economics, notes, suggestedListPrice: suggested, potentialDollars }
+  const result = {
+    ...base,
+    economics,
+    notes,
+    suggestedListPrice: suggested,
+    potentialDollars,
+  }
 
   if (part.costBasis == null) {
     return {
       ...result,
       action: 'NEEDS_DATA',
-      reason: `Market is $${economics.grossOrder.toFixed(2)} but there is no cost basis, so margin is unknown.`,
+      reason: `Market is $${economics.grossOrder.toFixed(2)}, but there is no cost basis, so margin is unknown.`,
     }
   }
 
-  const trendPct = Math.abs(costTrend.pctPerPeriod ?? 0).toFixed(1)
   const marginText = marginPct == null ? 'n/a' : `${marginPct.toFixed(1)}%`
-  const netText = `$${economics.netProceeds.toFixed(2)} net`
+  const marketHistoryIsActionable = marketTrend.basis === 'history'
+  const supplyHistoryIsActionable = supplyTrend.basis === 'history'
+  const demandHistoryIsActionable = demandTrend.basis === 'history'
+  const marketMove = Math.abs(marketTrend.pctPer30d ?? 0).toFixed(1)
 
-  // 1. Losing money outright.
   if (marginDollars != null && marginDollars < 0) {
     return {
       ...result,
       action: 'DUMP',
-      reason: `Underwater: ${netText} against a $${part.costBasis.toFixed(2)} cost basis loses $${Math.abs(marginDollars).toFixed(2)} per unit.`,
+      reason: `Underwater: $${economics.netProceeds.toFixed(2)} net against a $${part.costBasis.toFixed(2)} cost basis loses $${Math.abs(marginDollars).toFixed(2)} per unit.`,
     }
   }
 
-  // 2. Below the floor.
   if (marginPct != null && marginPct < min) {
-    if (costTrend.direction === 'falling') {
+    if (marketHistoryIsActionable && marketTrend.direction === 'falling') {
       return {
         ...result,
         action: 'DUMP',
-        reason: `Margin ${marginText} is under the ${min.toFixed(0)}% floor and the market is falling ${trendPct}%/window — it gets worse from here.`,
+        reason: `Margin ${marginText} is below the ${min.toFixed(0)}% floor and qualified sold-price history is falling ${marketMove}% per 30 days.`,
       }
     }
-    if (costTrend.direction === 'rising') {
+    if (marketHistoryIsActionable && marketTrend.direction === 'rising') {
       return {
         ...result,
         action: 'HOLD',
-        reason: `Margin ${marginText} is under the ${min.toFixed(0)}% floor, but the market is rising ${trendPct}%/window — worth waiting.`,
+        reason: `Margin ${marginText} is below the ${min.toFixed(0)}% floor, but qualified sold-price history is rising ${marketMove}% per 30 days.`,
       }
     }
     return {
       ...result,
       action: 'WATCH',
-      reason: `Margin ${marginText} is under the ${min.toFixed(0)}% floor and the market is flat.`,
+      reason: `Margin ${marginText} is below the ${min.toFixed(0)}% floor, but there is not yet qualified historical price direction to justify a dump or hold call.`,
     }
   }
 
-  // 3. At or above target.
   if (marginPct != null && marginPct >= target) {
-    if (costTrend.direction === 'falling') {
+    if (marketHistoryIsActionable && marketTrend.direction === 'falling') {
       return {
         ...result,
         action: 'LIST_NOW',
-        reason: `Margin ${marginText} beats the ${target.toFixed(0)}% target and the market is falling ${trendPct}%/window — list before it erodes.`,
+        reason: `Margin ${marginText} clears the ${target.toFixed(0)}% target while qualified sold-price history is falling ${marketMove}% per 30 days.`,
       }
     }
-    if (supplyTrend.direction === 'rising' && supplyTrend.strong) {
+    if (supplyHistoryIsActionable && supplyTrend.strong && supplyTrend.direction === 'rising') {
       return {
         ...result,
         action: 'LIST_NOW',
-        reason: `Margin ${marginText} is healthy and competing supply is climbing — list ahead of the crowd.`,
+        reason: `Margin ${marginText} clears target while qualified active-listing history shows competition rising quickly.`,
       }
     }
-    if (costTrend.direction === 'rising' && costTrend.strong) {
+    if (
+      (marketHistoryIsActionable && marketTrend.strong && marketTrend.direction === 'rising') ||
+      (demandHistoryIsActionable && demandTrend.strong && demandTrend.direction === 'rising')
+    ) {
       return {
         ...result,
         action: 'HOLD',
-        reason: `Margin ${marginText} is already above target and the market is climbing ${trendPct}%/window — holding earns more.`,
+        reason: `Margin ${marginText} clears target and qualified history is strengthening without a falling sold-price trend.`,
       }
     }
     return {
       ...result,
       action: 'LIST',
-      reason: `Margin ${marginText} meets the ${target.toFixed(0)}% target in a stable market.`,
+      reason: `Margin ${marginText} meets the ${target.toFixed(0)}% target. No qualified historical signal currently overrides the economics.`,
     }
   }
 
-  // 4. Between the floor and the target.
-  if (costTrend.direction === 'rising') {
+  if (marketHistoryIsActionable && marketTrend.direction === 'rising') {
     return {
       ...result,
       action: 'HOLD',
-      reason: `Margin ${marginText} sits between the ${min.toFixed(0)}% floor and the ${target.toFixed(0)}% target, and the market is rising ${trendPct}%/window.`,
+      reason: `Margin ${marginText} is between the floor and target, while qualified sold-price history is rising ${marketMove}% per 30 days.`,
     }
   }
-  if (costTrend.direction === 'falling') {
+  if (marketHistoryIsActionable && marketTrend.direction === 'falling') {
     return {
       ...result,
       action: 'LIST',
-      reason: `Margin ${marginText} is workable but the market is falling ${trendPct}%/window — take it now rather than chasing the target.`,
+      reason: `Margin ${marginText} is workable, while qualified sold-price history is falling ${marketMove}% per 30 days.`,
     }
   }
   return {
     ...result,
     action: 'WATCH',
-    reason: `Margin ${marginText} is below the ${target.toFixed(0)}% target in a flat market.`,
+    reason: `Margin ${marginText} is between the ${min.toFixed(0)}% floor and ${target.toFixed(0)}% target without enough qualified history to force timing.`,
   }
 }
 
-/** Board ordering: action priority first, then dollars actually at stake. */
 export function compareDecisions(
   a: { decision: Decision },
   b: { decision: Decision },
 ): number {
   const byAction = ACTION_PRIORITY[a.decision.action] - ACTION_PRIORITY[b.decision.action]
   if (byAction !== 0) return byAction
-  const aDollars = Math.abs(a.decision.potentialDollars ?? 0)
-  const bDollars = Math.abs(b.decision.potentialDollars ?? 0)
-  return bDollars - aDollars
+  return Math.abs(b.decision.potentialDollars ?? 0) - Math.abs(a.decision.potentialDollars ?? 0)
 }
