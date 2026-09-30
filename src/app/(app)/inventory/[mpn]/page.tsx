@@ -3,35 +3,30 @@ import { notFound } from 'next/navigation'
 
 import { PartDetailForm } from '@/components/part-detail-form'
 import {
-  ActiveSupplyHistoryChart,
+  AverageSoldPriceChart,
   PriceShippingChart,
   SoldHistoryChart,
-  SoldVelocityChart,
-  WindowCurveChart,
+  SoldUnitsHistoryChart,
+  UnitsSoldChart,
   type HistoryPoint,
   type PeriodPoint,
 } from '@/components/part-charts'
-import { ActionBadge, Chip, Notice, Panel, SourceBadge, StatCard } from '@/components/ui'
-import {
-  activeSnapshotHistory,
-  getPartWithMarket,
-  getSettings,
-  loadTrendSummaries,
-  snapshotHistory,
-} from '@/db/queries'
-import { decide } from '@/lib/decisions'
-import { money, percent, relativeTime, signedPercent, toNumber } from '@/lib/format'
+import { Chip, Notice, Panel, StatCard } from '@/components/ui'
+import { getPartByMpn, researchSessionHistory } from '@/db/queries'
+import { money, relativeTime } from '@/lib/format'
 import { requireSession } from '@/lib/session'
-import { spacedWindowTrend, trendValueAtX } from '@/lib/stats'
+import { timeTrend } from '@/lib/stats'
 import {
   PERIOD_DAYS,
   PERIODS,
   PERIOD_LABELS,
-  PRICE_BASIS_LABELS,
+  type MarketResearchSession,
   type Period,
 } from '@/lib/types'
 
 export const dynamic = 'force-dynamic'
+
+const TABLE_PERIODS: Period[] = ['7d', '30d', '90d', '6m', '1yr']
 
 export async function generateMetadata(props: { params: Promise<{ mpn: string }> }) {
   const { mpn } = await props.params
@@ -39,19 +34,52 @@ export async function generateMetadata(props: { params: Promise<{ mpn: string }>
 }
 
 function collapseLatestPerDay(
-  rows: { at: Date; value: number | null }[],
+  sessions: MarketResearchSession[],
+  valueFor: (session: MarketResearchSession) => number | null | undefined,
 ): HistoryPoint[] {
   const byDay = new Map<string, { atMs: number; point: HistoryPoint }>()
-  for (const row of rows) {
-    if (row.value == null || !Number.isFinite(row.value)) continue
-    const atMs = row.at.getTime()
-    const day = row.at.toISOString().slice(0, 10)
+
+  for (const session of sessions) {
+    const value = valueFor(session)
+    if (value == null || !Number.isFinite(value)) continue
+
+    const atMs = new Date(session.researchedAt).getTime()
+    if (!Number.isFinite(atMs)) continue
+
+    const day = new Date(atMs).toISOString().slice(0, 10)
     const existing = byDay.get(day)
-    if (!existing || atMs >= existing.atMs) byDay.set(day, { atMs, point: { at: day, value: row.value } })
+    if (!existing || atMs >= existing.atMs) {
+      byDay.set(day, { atMs, point: { at: day, value } })
+    }
   }
+
   return [...byDay.values()]
     .sort((a, b) => a.atMs - b.atMs)
     .map((entry) => entry.point)
+}
+
+function fullDate(iso: string | null | undefined): string {
+  if (!iso) return 'Not researched'
+  const date = new Date(iso)
+  if (!Number.isFinite(date.getTime())) return 'Not researched'
+  return date.toLocaleString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  })
+}
+
+function historyStatus(points: HistoryPoint[]) {
+  const trend = timeTrend(points)
+  if (trend.qualified) return { trend, label: 'Trend ready', tone: 'good' as const }
+  if (trend.points < 2) return { trend, label: 'Need repeat research', tone: 'dim' as const }
+  return {
+    trend,
+    label: `${trend.points} dates · ${Math.round(trend.spanDays)}d span`,
+    tone: 'warn' as const,
+  }
 }
 
 export default async function PartDetailPage(props: { params: Promise<{ mpn: string }> }) {
@@ -59,178 +87,199 @@ export default async function PartDetailPage(props: { params: Promise<{ mpn: str
 
   const { mpn: raw } = await props.params
   const mpn = decodeURIComponent(raw)
-  const [settings, loadedPart] = await Promise.all([getSettings(), getPartWithMarket(mpn)])
-  if (!loadedPart) {
+  const part = await getPartByMpn(mpn)
+
+  if (!part) {
     notFound()
     throw new Error('Part not found')
   }
-  const part = loadedPart
 
-  const [marketRows, activeRows, summaries] = await Promise.all([
-    snapshotHistory(part.id),
-    activeSnapshotHistory(part.id),
-    loadTrendSummaries([part.id]),
-  ])
-  const summary = summaries.get(part.id)
-  const decision = decide(part, settings, summary)
-
-  const windowFit = spacedWindowTrend(
-    PERIODS.map((period) => ({
-      daysAgo: PERIOD_DAYS[period],
-      value:
-        part.periods[period]?.price == null
-          ? null
-          : part.periods[period]!.price! + (part.periods[period]!.shipping ?? 0),
-    })),
-  )
-  const fitInput = PERIODS.map((period) => ({
-    x: -PERIOD_DAYS[period],
-    value:
-      part.periods[period]?.price == null
-        ? null
-        : part.periods[period]!.price! + (part.periods[period]!.shipping ?? 0),
-  }))
+  const sessions = await researchSessionHistory(part.id, 100)
+  const latest = sessions[0] ?? null
+  const periods = latest?.periods ?? {}
+  const thirty = periods['30d']
+  const seven = periods['7d']
+  const delivered30 =
+    thirty?.price == null ? null : thirty.price + (thirty.shipping ?? 0)
+  const velocity30 =
+    thirty?.soldQty == null ? null : thirty.soldQty / PERIOD_DAYS['30d']
 
   const chartData: PeriodPoint[] = PERIODS.map((period) => {
-    const observation = part.periods[period]
-    const totalCost =
-      observation?.price == null ? null : observation.price + (observation.shipping ?? 0)
+    const observation = periods[period]
+    const delivered =
+      observation?.price == null
+        ? null
+        : observation.price + (observation.shipping ?? 0)
+
     return {
-      period: PERIOD_LABELS[period],
+      period: PERIOD_LABELS[period]
+        .replace('1 Year', '1Y')
+        .replace('6 Months', '6M')
+        .replace('90 Days', '90D')
+        .replace('30 Days', '30D')
+        .replace('7 Days', '7D'),
       daysAgo: PERIOD_DAYS[period],
-      totalCost,
-      trend: trendValueAtX(fitInput, windowFit, -PERIOD_DAYS[period]),
-      price: observation?.price ?? null,
-      shipping: observation?.shipping ?? null,
+      avgSoldPrice: observation?.price ?? null,
+      avgShipping: observation?.shipping ?? null,
+      delivered,
       soldQty: observation?.soldQty ?? null,
       soldPerDay:
-        observation?.soldQty == null ? null : observation.soldQty / PERIOD_DAYS[period],
+        observation?.soldQty == null
+          ? null
+          : observation.soldQty / PERIOD_DAYS[period],
     }
   })
 
-  const historyPeriod: Period = summary?.marketPeriod ?? '30d'
-  const soldHistory = collapseLatestPerDay(
-    marketRows
-      .filter((row) => row.period === historyPeriod && row.priceBasis === 'sold')
-      .map((row) => ({
-        at: row.capturedAt,
-        value:
-          toNumber(row.price) == null
-            ? null
-            : (toNumber(row.price) as number) + (toNumber(row.shipping) ?? 0),
-      })),
+  const avgPriceHistory = collapseLatestPerDay(
+    sessions,
+    (session) => session.periods['30d']?.price,
   )
-  const supplyHistory = collapseLatestPerDay(
-    activeRows.map((row) => ({ at: row.capturedAt, value: row.activeQty })),
+  const unitsHistory = collapseLatestPerDay(
+    sessions,
+    (session) => session.periods['30d']?.soldQty,
   )
+  const priceHistoryStatus = historyStatus(avgPriceHistory)
+  const unitsHistoryStatus = historyStatus(unitsHistory)
 
-  const economics = decision.economics
-  const hasWindowData = chartData.some((point) => point.totalCost != null || point.soldQty != null)
-  const active = part.activeMarket
+  const hasAveragePrice = chartData.some((point) => point.avgSoldPrice != null)
+  const hasPriceShipping = chartData.some(
+    (point) => point.avgSoldPrice != null || point.avgShipping != null,
+  )
+  const hasUnits = chartData.some((point) => point.soldQty != null)
 
   return (
     <div>
-      <div className="mb-6">
-        <Link href="/inventory" className="text-ink-faint hover:text-ink mb-3 inline-block font-mono text-xs transition-colors">
-          ← Inventory
+      <div className="mb-5">
+        <Link
+          href="/opportunities"
+          className="text-ink-faint hover:text-ink mb-3 inline-block font-mono text-xs transition-colors"
+        >
+          ← Market Opportunities
         </Link>
+
         <div className="flex flex-wrap items-end justify-between gap-3">
           <div>
-            <h1 className="text-info font-mono text-lg font-semibold">{part.mpn}</h1>
-            <p className="text-ink mt-0.5 text-sm">{part.description}</p>
-            <div className="mt-2 flex flex-wrap items-center gap-2">
-              <Chip>{part.category}</Chip>
-              <Chip tone={part.inventoryQty > 1 ? 'good' : 'dim'}>{part.inventoryQty} on hand</Chip>
-              {!part.active && <Chip tone="warn">Inactive</Chip>}
-              {part.sourceUrl && (
-                <a href={part.sourceUrl} target="_blank" rel="noopener noreferrer" className="text-ink-faint hover:text-info font-mono text-xs transition-colors">
-                  reference ↗
-                </a>
-              )}
-            </div>
+            <h1 className="text-ink text-lg font-semibold tracking-tight">
+              <span className="text-info font-mono">{part.mpn}</span>
+              <span className="text-ink-faint"> — </span>
+              {part.description}
+              <span className="text-ink-faint font-normal"> · Inventory: {part.inventoryQty}</span>
+            </h1>
+            <p className="text-ink-dim mt-1 text-sm">
+              Last researched: {latest ? fullDate(latest.researchedAt) : 'Not researched'}
+            </p>
           </div>
-          <ActionBadge action={decision.action} />
+
+          <div className="flex items-center gap-2">
+            <Chip>{part.category}</Chip>
+            {!part.active && <Chip tone="warn">Inactive</Chip>}
+            <Link
+              href={`/tracker?mpns=${encodeURIComponent(part.mpn)}`}
+              className="border-good/40 bg-good/10 text-good hover:bg-good/20 rounded border px-3 py-1.5 text-xs font-medium transition-colors"
+            >
+              {latest ? 'Update Research' : 'Research MPN'}
+            </Link>
+          </div>
         </div>
       </div>
 
-      <div className="mb-6">
-        <Panel title="Recommendation">
-          <p className="text-ink text-sm">{decision.reason}</p>
-          {decision.notes.length > 0 && (
-            <ul className="text-ink-dim mt-2 space-y-0.5 text-xs">
-              {decision.notes.map((note) => <li key={note}>· {note}</li>)}
-            </ul>
-          )}
-          <div className="mt-3 flex flex-wrap items-center gap-2">
-            {decision.suggestedListPrice != null && (
-              <Chip tone="info">Target {decision.targetMarginPct.toFixed(0)}% margin at {money(decision.suggestedListPrice)} + {money(economics?.shipping ?? 0)} shipping</Chip>
-            )}
-            <Chip tone={decision.provenance === 'sold' ? 'good' : decision.provenance === 'asking' ? 'warn' : 'dim'}>
-              price basis: {decision.provenance}
-            </Chip>
-          </div>
-        </Panel>
-      </div>
+      {!latest && (
+        <div className="mb-5">
+          <Notice tone="info">
+            This MPN has no dated eBay Product Research session yet. Blank market values are intentional;
+            nothing below is fabricated.
+          </Notice>
+        </div>
+      )}
 
-      <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-4">
+      <div className="mb-5 grid grid-cols-2 gap-3 xl:grid-cols-4">
         <StatCard
-          label="Buyer pays"
-          value={money(economics?.grossOrder)}
-          sub={economics ? `${money(economics.price)} + ${money(economics.shipping)} ship` : 'No market price yet'}
-          hint="Item price plus buyer-paid shipping. The eBay percentage fee is modeled on this order total."
+          label="30D Avg Sold Price"
+          value={money(thirty?.price)}
+          sub={
+            thirty?.price == null
+              ? 'No 30d research yet'
+              : `Avg ship ${money(thirty.shipping)} · delivered ${money(delivered30)}`
+          }
+          tone="info"
         />
         <StatCard
-          label="You net"
-          value={money(economics?.netProceeds)}
-          sub={economics ? `after ${money(economics.fees)} fees, ${money(economics.shipCost)} ship` : undefined}
-          hint={`Fee model: ${settings.feePct}% of the order plus ${money(settings.feeFixed)} fixed.`}
+          label="30D Total Sold"
+          value={thirty?.soldQty == null ? '—' : String(thirty.soldQty)}
+          sub={velocity30 == null ? 'No 30d volume yet' : `${velocity30.toFixed(2)} sold/day`}
+          tone={thirty?.soldQty == null ? 'neutral' : 'good'}
         />
         <StatCard
-          label="Margin"
-          value={money(economics?.marginDollars)}
-          sub={economics?.marginPct != null ? `${percent(economics.marginPct)}${economics.roiPct != null ? ` · ${percent(economics.roiPct, 0)} ROI` : ''}` : part.costBasis == null ? 'Set a cost basis' : undefined}
-          tone={economics?.marginDollars == null ? 'neutral' : economics.marginDollars < 0 ? 'bad' : 'good'}
+          label="7D Total Sold"
+          value={seven?.soldQty == null ? '—' : String(seven.soldQty)}
+          sub={
+            seven?.soldQty == null
+              ? 'No 7d volume yet'
+              : `${(seven.soldQty / PERIOD_DAYS['7d']).toFixed(2)} sold/day`
+          }
+          tone={seven?.soldQty == null ? 'neutral' : 'good'}
         />
         <StatCard
-          label="Sold-price trend"
-          value={decision.marketTrend.direction === 'unknown' ? 'Not qualified' : decision.marketTrend.direction === 'flat' ? 'Flat' : decision.marketTrend.direction === 'rising' ? 'Rising' : 'Falling'}
-          sub={decision.marketTrend.pctPer30d != null ? `${signedPercent(decision.marketTrend.pctPer30d)} / 30d · ${decision.marketTrend.basis}` : `${decision.marketTrend.points} points`}
-          tone={decision.marketTrend.basis !== 'history' ? 'neutral' : decision.marketTrend.direction === 'rising' ? 'good' : decision.marketTrend.direction === 'falling' ? 'bad' : 'neutral'}
-          hint="Only history with at least 3 distinct capture dates spanning at least 14 days can drive a recommendation."
+          label="Research Freshness"
+          value={latest ? relativeTime(latest.researchedAt) : 'Not researched'}
+          sub={latest ? fullDate(latest.researchedAt) : 'Open Tracker to create the first session'}
+          tone={latest ? 'info' : 'neutral'}
         />
       </div>
 
-      <div className="mb-6">
-        <Panel title="Sold-market aggregates by lookback window" className="overflow-hidden">
+      <div className="mb-5">
+        <Panel title="Current sold-market research" className="overflow-hidden">
           <div className="overflow-x-auto">
             <table className="w-full border-collapse text-sm" style={{ minWidth: 760 }}>
               <thead>
                 <tr className="border-line border-b">
-                  {['Window', 'Price', 'Buyer ship', 'Buyer total', 'Sold qty', 'Velocity', 'Basis / source'].map((header, i) => (
-                    <th key={header} scope="col" className={`text-ink-faint pb-2 text-xs font-medium tracking-widest uppercase ${i === 0 || i === 6 ? 'text-left' : 'px-3 text-right'}`}>{header}</th>
+                  {[
+                    'Period',
+                    'Avg Sold Price',
+                    'Avg Shipping',
+                    'Delivered',
+                    'Total Sold',
+                    'Total Sellers',
+                  ].map((header, index) => (
+                    <th
+                      key={header}
+                      scope="col"
+                      className={`text-ink-faint pb-2 text-xs font-medium tracking-widest uppercase ${
+                        index === 0 ? 'text-left' : 'px-3 text-right'
+                      }`}
+                    >
+                      {header}
+                    </th>
                   ))}
                 </tr>
               </thead>
               <tbody>
-                {PERIODS.map((period) => {
-                  const observation = part.periods[period]
-                  const total = observation?.price == null ? null : observation.price + (observation.shipping ?? 0)
+                {TABLE_PERIODS.map((period) => {
+                  const observation = periods[period]
+                  const delivered =
+                    observation?.price == null
+                      ? null
+                      : observation.price + (observation.shipping ?? 0)
+
                   return (
                     <tr key={period} className="border-line/50 border-b last:border-0">
-                      <td className="text-ink-dim py-2 font-mono text-xs tracking-widest uppercase">{PERIOD_LABELS[period]}</td>
-                      <td className="text-ink px-3 py-2 text-right font-mono text-xs">{money(observation?.price)}</td>
-                      <td className="text-ink px-3 py-2 text-right font-mono text-xs">{money(observation?.shipping)}</td>
-                      <td className="text-ink px-3 py-2 text-right font-mono text-xs font-semibold">{money(total)}</td>
-                      <td className="text-ink-dim px-3 py-2 text-right font-mono text-xs">{observation?.soldQty ?? '—'}</td>
-                      <td className="text-ink-dim px-3 py-2 text-right font-mono text-xs">{observation?.soldQty == null ? '—' : `${(observation.soldQty / PERIOD_DAYS[period]).toFixed(2)}/day`}</td>
-                      <td className="py-2 pl-3">
-                        {observation ? (
-                          <span className="flex flex-wrap items-center gap-1.5">
-                            <Chip tone={observation.priceBasis === 'sold' ? 'good' : observation.priceBasis === 'asking' ? 'warn' : 'dim'}>{PRICE_BASIS_LABELS[observation.priceBasis]}</Chip>
-                            <SourceBadge source={observation.source} />
-                            <span className="text-ink-faint font-mono text-[10px]">{relativeTime(observation.capturedAt)}{observation.sampleSize ? ` · n=${observation.sampleSize}` : ''}</span>
-                          </span>
-                        ) : <span className="text-ink-ghost font-mono text-xs">—</span>}
+                      <td className="text-ink-dim py-2 font-mono text-xs tracking-widest uppercase">
+                        {PERIOD_LABELS[period]}
+                      </td>
+                      <td className="text-ink px-3 py-2 text-right font-mono text-xs">
+                        {money(observation?.price)}
+                      </td>
+                      <td className="text-ink-dim px-3 py-2 text-right font-mono text-xs">
+                        {money(observation?.shipping)}
+                      </td>
+                      <td className="text-ink px-3 py-2 text-right font-mono text-xs font-semibold">
+                        {money(delivered)}
+                      </td>
+                      <td className="text-ink px-3 py-2 text-right font-mono text-xs">
+                        {observation?.soldQty ?? '—'}
+                      </td>
+                      <td className="text-ink-dim px-3 py-2 text-right font-mono text-xs">
+                        {observation?.totalSellers ?? '—'}
                       </td>
                     </tr>
                   )
@@ -238,47 +287,96 @@ export default async function PartDetailPage(props: { params: Promise<{ mpn: str
               </tbody>
             </table>
           </div>
-          <p className="text-ink-faint mt-3 text-xs">Nested sold windows are aggregates, not a time series. Sold quantity is normalized to units/day when windows are compared.</p>
+          <p className="text-ink-faint mt-3 text-xs">
+            These five values are nested eBay Product Research lookback windows from the latest dated
+            session. They show the current cross-window shape; they are not calendar history.
+          </p>
         </Panel>
       </div>
 
-      <div className="mb-6">
-        <Panel title="Active eBay competition — point in time">
-          {active ? (
-            <div className="grid gap-3 sm:grid-cols-4">
-              <StatCard label="Median asking" value={money(active.askingPrice)} sub={active.source === 'ebay_browse' ? 'used active listings' : 'manual'} />
-              <StatCard label="Buyer shipping" value={money(active.askingShipping)} />
-              <StatCard label="Active listings" value={active.activeQty == null ? '—' : String(active.activeQty)} sub={active.truncated ? 'truncated sample; count withheld' : 'point-in-time competition'} tone={active.truncated ? 'warn' : 'neutral'} />
-              <StatCard label="Qualified sample" value={active.sampleSize == null ? '—' : String(active.sampleSize)} sub={active.mpnRejectedCount != null ? `${active.mpnRejectedCount} wrong-MPN rejected` : relativeTime(active.capturedAt)} />
-            </div>
+      <div className="mb-5 grid gap-4 xl:grid-cols-3">
+        <Panel title="Average Sold Price by Lookback Window">
+          {hasAveragePrice ? (
+            <AverageSoldPriceChart data={chartData} />
           ) : (
-            <p className="text-ink-dim text-sm">No active-listing snapshot yet. Preview eBay Active in the Tracker or enter the point-in-time values manually.</p>
+            <p className="text-ink-dim py-16 text-center text-sm">
+              No average sold-price values in the latest research session.
+            </p>
+          )}
+        </Panel>
+
+        <Panel title="Avg Sold Price vs Avg Shipping">
+          {hasPriceShipping ? (
+            <PriceShippingChart data={chartData} />
+          ) : (
+            <p className="text-ink-dim py-16 text-center text-sm">
+              No sold-price or shipping values in the latest research session.
+            </p>
+          )}
+        </Panel>
+
+        <Panel title="Units Sold by Period">
+          {hasUnits ? (
+            <UnitsSoldChart data={chartData} />
+          ) : (
+            <p className="text-ink-dim py-16 text-center text-sm">
+              No total-sold values in the latest research session.
+            </p>
           )}
         </Panel>
       </div>
 
-      {hasWindowData ? (
-        <div className="mb-6 grid gap-4" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(340px, 1fr))' }}>
-          <Panel title="Current lookback curve — context only"><WindowCurveChart data={chartData} /></Panel>
-          <Panel title="Price vs buyer shipping"><PriceShippingChart data={chartData} /></Panel>
-          <Panel title="Sold velocity"><SoldVelocityChart data={chartData} /></Panel>
+      <div className="mb-5">
+        <div className="mb-3">
+          <h2 className="text-ink text-sm font-semibold">Calendar history</h2>
+          <p className="text-ink-dim mt-0.5 text-xs">
+            Unlike the three charts above, these use repeated research dates. Same-day corrections
+            collapse to the latest value for chart/trend math while the raw sessions remain stored.
+          </p>
         </div>
-      ) : (
-        <div className="mb-6"><Notice tone="info">No sold-window data yet. Enter sold comps in the Tracker or run an authorized Marketplace Insights sync.</Notice></div>
-      )}
 
-      <div className="mb-6 grid gap-4" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(340px, 1fr))' }}>
-        <Panel title={`${PERIOD_LABELS[historyPeriod]} sold price over calendar time`}>
-          {soldHistory.length >= 2 ? <SoldHistoryChart data={soldHistory} label={`${PERIOD_LABELS[historyPeriod]} sold buyer total`} /> : <p className="text-ink-dim py-6 text-center text-sm">Historical sold-price trend needs repeated captures. Same-day corrections are kept in the database but collapsed to the latest reading for trend math.</p>}
-        </Panel>
-        <Panel title="Active competition over calendar time">
-          {supplyHistory.length >= 2 ? <ActiveSupplyHistoryChart data={supplyHistory} /> : <p className="text-ink-dim py-6 text-center text-sm">Active supply is a point-in-time measure. Its trend appears after repeated captures; at least 3 distinct dates spanning 14 days are required before it can affect a recommendation.</p>}
-        </Panel>
+        <div className="grid gap-4 xl:grid-cols-2">
+          <Panel
+            title="30D Avg Sold Price History"
+            action={<Chip tone={priceHistoryStatus.tone}>{priceHistoryStatus.label}</Chip>}
+          >
+            {avgPriceHistory.length >= 2 ? (
+              <SoldHistoryChart data={avgPriceHistory} />
+            ) : (
+              <p className="text-ink-dim py-16 text-center text-sm">
+                Research this MPN on at least two different dates to draw calendar price history.
+              </p>
+            )}
+          </Panel>
+
+          <Panel
+            title="30D Units Sold History"
+            action={<Chip tone={unitsHistoryStatus.tone}>{unitsHistoryStatus.label}</Chip>}
+          >
+            {unitsHistory.length >= 2 ? (
+              <SoldUnitsHistoryChart data={unitsHistory} />
+            ) : (
+              <p className="text-ink-dim py-16 text-center text-sm">
+                Research this MPN on at least two different dates to draw calendar sold-volume history.
+              </p>
+            )}
+          </Panel>
+        </div>
+
+        <p className="text-ink-faint mt-3 text-xs">
+          A calendar trend becomes mature only after at least 3 distinct research dates spanning 14
+          days. Before that, the charts are history context only.
+        </p>
       </div>
 
-      <p className="text-ink-faint mb-6 text-xs">Enter or correct market observations in the <Link href="/tracker" className="text-info hover:text-good transition-colors">Tracker</Link>. Nothing is written while you type; only an explicit Save MPN persists changes.</p>
-
-      <PartDetailForm partId={part.id} description={part.description} category={part.category} notes={part.notes} sourceUrl={part.sourceUrl} active={part.active} />
+      <PartDetailForm
+        partId={part.id}
+        description={part.description}
+        category={part.category}
+        notes={part.notes}
+        sourceUrl={part.sourceUrl}
+        active={part.active}
+      />
     </div>
   )
 }

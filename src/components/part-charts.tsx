@@ -18,9 +18,10 @@ import {
 import { money } from '@/lib/format'
 
 const SERIES = {
-  primary: '#3987e5',
-  secondary: '#d95926',
-  tertiary: '#199e70',
+  price: '#3b82f6',
+  shipping: '#8b92a8',
+  quantity: '#f59e0b',
+  history: '#22c55e',
 } as const
 
 const SURFACE = '#0e1018'
@@ -91,22 +92,33 @@ function ChartTooltip({
 export type PeriodPoint = {
   period: string
   daysAgo: number
-  totalCost: number | null
-  trend: number | null
-  price: number | null
-  shipping: number | null
+  avgSoldPrice?: number | null
+  avgShipping?: number | null
+  delivered?: number | null
   soldQty: number | null
-  soldPerDay: number | null
+  soldPerDay?: number | null
+  // Legacy aliases retained so older hidden surfaces compile during transition.
+  totalCost?: number | null
+  trend?: number | null
+  price?: number | null
+  shipping?: number | null
 }
 
-/**
- * Current-window shape only. The x-axis uses actual days of lookback so the
- * 1yr→6m gap is not drawn as equal to 30d→7d. This chart is context, not
- * longitudinal history; only the calendar-history chart can qualify a trend.
- */
-export function WindowCurveChart({ data }: { data: PeriodPoint[] }) {
-  const ordered = [...data].sort((a, b) => b.daysAgo - a.daysAgo)
-  const hasTrend = ordered.some((point) => point.trend != null)
+function normalizePeriodData(data: PeriodPoint[]) {
+  return data.map((point) => ({
+    ...point,
+    avgSoldPrice: point.avgSoldPrice ?? point.price ?? null,
+    avgShipping: point.avgShipping ?? point.shipping ?? null,
+    delivered:
+      point.delivered ??
+      (point.avgSoldPrice ?? point.price) == null
+        ? point.totalCost ?? null
+        : (point.avgSoldPrice ?? point.price ?? 0) + (point.avgShipping ?? point.shipping ?? 0),
+  }))
+}
+
+export function AverageSoldPriceChart({ data }: { data: PeriodPoint[] }) {
+  const ordered = [...normalizePeriodData(data)].sort((a, b) => b.daysAgo - a.daysAgo)
 
   return (
     <ResponsiveContainer width="100%" height={230}>
@@ -121,39 +133,36 @@ export function WindowCurveChart({ data }: { data: PeriodPoint[] }) {
           width={52}
           domain={FITTED_DOMAIN}
         />
-        <Tooltip content={<ChartTooltip />} cursor={{ stroke: GRID, strokeWidth: 1 }} />
-        {hasTrend && <Legend wrapperStyle={legendStyle} iconSize={8} />}
+        <Tooltip
+          content={<ChartTooltip moneyKeys={['avgSoldPrice']} />}
+          cursor={{ stroke: GRID, strokeWidth: 1 }}
+        />
         <Area
           type="monotone"
-          dataKey="totalCost"
-          name="Buyer total"
-          stroke={SERIES.primary}
-          fill={SERIES.primary}
+          dataKey="avgSoldPrice"
+          name="Avg sold price"
+          stroke={SERIES.price}
+          fill={SERIES.price}
           fillOpacity={0.12}
           strokeWidth={2}
           connectNulls={false}
         />
-        {hasTrend && (
-          <Line
-            type="linear"
-            dataKey="trend"
-            name="Window fit"
-            stroke={AXIS_TEXT}
-            strokeWidth={1.5}
-            strokeDasharray="5 4"
-            dot={false}
-            connectNulls
-          />
-        )}
       </AreaChart>
     </ResponsiveContainer>
   )
 }
 
+/** @deprecated Use AverageSoldPriceChart. */
+export function WindowCurveChart({ data }: { data: PeriodPoint[] }) {
+  return <AverageSoldPriceChart data={data} />
+}
+
 export function PriceShippingChart({ data }: { data: PeriodPoint[] }) {
+  const normalized = normalizePeriodData(data)
+
   return (
     <ResponsiveContainer width="100%" height={230}>
-      <BarChart data={data} margin={{ top: 8, right: 12, left: -12, bottom: 0 }}>
+      <BarChart data={normalized} margin={{ top: 8, right: 12, left: -12, bottom: 0 }}>
         <CartesianGrid stroke={GRID} strokeWidth={1} vertical={false} />
         <XAxis dataKey="period" tick={axisTick} axisLine={false} tickLine={false} />
         <YAxis
@@ -163,22 +172,25 @@ export function PriceShippingChart({ data }: { data: PeriodPoint[] }) {
           tickFormatter={(value: number) => `$${value}`}
           width={52}
         />
-        <Tooltip content={<ChartTooltip />} cursor={{ fill: 'rgba(255,255,255,0.03)' }} />
+        <Tooltip
+          content={<ChartTooltip moneyKeys={['avgSoldPrice', 'avgShipping']} />}
+          cursor={{ fill: 'rgba(255,255,255,0.03)' }}
+        />
         <Legend wrapperStyle={legendStyle} iconSize={8} />
         <Bar
-          dataKey="price"
-          name="Item price"
+          dataKey="avgSoldPrice"
+          name="Avg sold price"
           stackId="order"
-          fill={SERIES.primary}
+          fill={SERIES.price}
           stroke={SURFACE}
           strokeWidth={2}
           maxBarSize={24}
         />
         <Bar
-          dataKey="shipping"
-          name="Buyer shipping"
+          dataKey="avgShipping"
+          name="Avg shipping"
           stackId="order"
-          fill={SERIES.secondary}
+          fill={SERIES.shipping}
           stroke={SURFACE}
           strokeWidth={2}
           radius={[4, 4, 0, 0]}
@@ -189,7 +201,32 @@ export function PriceShippingChart({ data }: { data: PeriodPoint[] }) {
   )
 }
 
-/** Sales velocity makes unequal nested windows comparable. */
+export function UnitsSoldChart({ data }: { data: PeriodPoint[] }) {
+  const ordered = [...data].sort((a, b) => b.daysAgo - a.daysAgo)
+
+  return (
+    <ResponsiveContainer width="100%" height={230}>
+      <BarChart data={ordered} margin={{ top: 8, right: 12, left: -12, bottom: 0 }}>
+        <CartesianGrid stroke={GRID} strokeWidth={1} vertical={false} />
+        <XAxis dataKey="period" tick={axisTick} axisLine={false} tickLine={false} />
+        <YAxis allowDecimals={false} tick={axisTick} axisLine={false} tickLine={false} width={52} />
+        <Tooltip
+          content={<ChartTooltip moneyKeys={[]} />}
+          cursor={{ fill: 'rgba(255,255,255,0.03)' }}
+        />
+        <Bar
+          dataKey="soldQty"
+          name="Units sold"
+          fill={SERIES.quantity}
+          radius={[4, 4, 0, 0]}
+          maxBarSize={26}
+        />
+      </BarChart>
+    </ResponsiveContainer>
+  )
+}
+
+/** Legacy diagnostic chart retained outside the primary dashboard. */
 export function SoldVelocityChart({ data }: { data: PeriodPoint[] }) {
   return (
     <ResponsiveContainer width="100%" height={230}>
@@ -204,7 +241,7 @@ export function SoldVelocityChart({ data }: { data: PeriodPoint[] }) {
         <Bar
           dataKey="soldPerDay"
           name="Sold velocity"
-          fill={SERIES.tertiary}
+          fill={SERIES.history}
           radius={[4, 4, 0, 0]}
           maxBarSize={24}
         />
@@ -215,7 +252,13 @@ export function SoldVelocityChart({ data }: { data: PeriodPoint[] }) {
 
 export type HistoryPoint = { at: string; value: number | null }
 
-export function SoldHistoryChart({ data, label = '30d sold buyer total' }: { data: HistoryPoint[]; label?: string }) {
+export function SoldHistoryChart({
+  data,
+  label = '30d avg sold price',
+}: {
+  data: HistoryPoint[]
+  label?: string
+}) {
   return (
     <ResponsiveContainer width="100%" height={240}>
       <LineChart data={data} margin={{ top: 8, right: 24, left: -12, bottom: 0 }}>
@@ -229,14 +272,17 @@ export function SoldHistoryChart({ data, label = '30d sold buyer total' }: { dat
           width={52}
           domain={FITTED_DOMAIN}
         />
-        <Tooltip content={<ChartTooltip />} cursor={{ stroke: GRID, strokeWidth: 1 }} />
+        <Tooltip
+          content={<ChartTooltip moneyKeys={['value']} />}
+          cursor={{ stroke: GRID, strokeWidth: 1 }}
+        />
         <Line
           type="monotone"
           dataKey="value"
           name={label}
-          stroke={SERIES.primary}
+          stroke={SERIES.price}
           strokeWidth={2}
-          dot={{ fill: SERIES.primary, r: 3.5, stroke: SURFACE, strokeWidth: 2 }}
+          dot={{ fill: SERIES.price, r: 3.5, stroke: SURFACE, strokeWidth: 2 }}
           activeDot={{ r: 5, stroke: SURFACE, strokeWidth: 2 }}
           connectNulls={false}
         />
@@ -245,6 +291,30 @@ export function SoldHistoryChart({ data, label = '30d sold buyer total' }: { dat
   )
 }
 
+export function SoldUnitsHistoryChart({ data }: { data: HistoryPoint[] }) {
+  return (
+    <ResponsiveContainer width="100%" height={240}>
+      <BarChart data={data} margin={{ top: 8, right: 12, left: -12, bottom: 0 }}>
+        <CartesianGrid stroke={GRID} strokeWidth={1} vertical={false} />
+        <XAxis dataKey="at" tick={axisTick} axisLine={false} tickLine={false} />
+        <YAxis allowDecimals={false} tick={axisTick} axisLine={false} tickLine={false} width={52} />
+        <Tooltip
+          content={<ChartTooltip moneyKeys={[]} />}
+          cursor={{ fill: 'rgba(255,255,255,0.03)' }}
+        />
+        <Bar
+          dataKey="value"
+          name="30d units sold"
+          fill={SERIES.quantity}
+          radius={[4, 4, 0, 0]}
+          maxBarSize={28}
+        />
+      </BarChart>
+    </ResponsiveContainer>
+  )
+}
+
+/** Retained for legacy/secondary surfaces; active competition is not primary dashboard data. */
 export function ActiveSupplyHistoryChart({ data }: { data: HistoryPoint[] }) {
   return (
     <ResponsiveContainer width="100%" height={240}>
@@ -252,11 +322,14 @@ export function ActiveSupplyHistoryChart({ data }: { data: HistoryPoint[] }) {
         <CartesianGrid stroke={GRID} strokeWidth={1} vertical={false} />
         <XAxis dataKey="at" tick={axisTick} axisLine={false} tickLine={false} />
         <YAxis allowDecimals={false} tick={axisTick} axisLine={false} tickLine={false} width={52} />
-        <Tooltip content={<ChartTooltip moneyKeys={[]} />} cursor={{ fill: 'rgba(255,255,255,0.03)' }} />
+        <Tooltip
+          content={<ChartTooltip moneyKeys={[]} />}
+          cursor={{ fill: 'rgba(255,255,255,0.03)' }}
+        />
         <Bar
           dataKey="value"
           name="Active listings"
-          fill={SERIES.secondary}
+          fill={SERIES.shipping}
           radius={[4, 4, 0, 0]}
           maxBarSize={28}
         />
