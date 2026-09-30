@@ -39,12 +39,12 @@ export type PeriodObservation = {
   shipping: number | null
   /** Units sold inside this lookback window. Never active-listing count. */
   soldQty: number | null
-  soldPriceMin: number | null
-  soldPriceMax: number | null
-  totalSellers: number | null
-  sellThroughPct: number | null
-  freeShippingPct: number | null
-  researchSessionId: number | null
+  soldPriceMin?: number | null
+  soldPriceMax?: number | null
+  totalSellers?: number | null
+  sellThroughPct?: number | null
+  freeShippingPct?: number | null
+  researchSessionId?: number | null
   source: SnapshotSource
   priceBasis: PriceBasis
   sampleSize: number | null
