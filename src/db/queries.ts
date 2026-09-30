@@ -9,6 +9,7 @@ import {
   PERIOD_DAYS,
   type ActiveMarketObservation,
   type EconomicSettings,
+  type MarketResearchSession,
   type Part,
   type PartWithMarket,
   type Period,
@@ -22,6 +23,7 @@ import { db } from './index'
 import {
   activeMarketSnapshots,
   ebaySyncRuns,
+  marketResearchSessions,
   marketSnapshots,
   parts,
   settings,
@@ -52,6 +54,12 @@ function mapObservation(row: {
   price: string | null
   shipping: string | null
   soldQty: number | null
+  soldPriceMin: string | null
+  soldPriceMax: string | null
+  totalSellers: number | null
+  sellThroughPct: string | null
+  freeShippingPct: string | null
+  researchSessionId: number | null
   source: SnapshotSource
   priceBasis: PriceBasis
   sampleSize: number | null
@@ -61,6 +69,12 @@ function mapObservation(row: {
     price: toNumber(row.price),
     shipping: toNumber(row.shipping),
     soldQty: row.soldQty,
+    soldPriceMin: toNumber(row.soldPriceMin),
+    soldPriceMax: toNumber(row.soldPriceMax),
+    totalSellers: row.totalSellers,
+    sellThroughPct: toNumber(row.sellThroughPct),
+    freeShippingPct: toNumber(row.freeShippingPct),
+    researchSessionId: row.researchSessionId,
     source: row.source,
     priceBasis: row.priceBasis,
     sampleSize: row.sampleSize,
@@ -244,6 +258,12 @@ export async function latestSnapshots(
       price: marketSnapshots.price,
       shipping: marketSnapshots.shipping,
       soldQty: marketSnapshots.soldQty,
+      soldPriceMin: marketSnapshots.soldPriceMin,
+      soldPriceMax: marketSnapshots.soldPriceMax,
+      totalSellers: marketSnapshots.totalSellers,
+      sellThroughPct: marketSnapshots.sellThroughPct,
+      freeShippingPct: marketSnapshots.freeShippingPct,
+      researchSessionId: marketSnapshots.researchSessionId,
       source: marketSnapshots.source,
       priceBasis: marketSnapshots.priceBasis,
       sampleSize: marketSnapshots.sampleSize,
@@ -334,6 +354,150 @@ export async function activeSnapshotHistory(partId: number, limit = 500): Promis
     .where(eq(activeMarketSnapshots.partId, partId))
     .orderBy(desc(activeMarketSnapshots.capturedAt), desc(activeMarketSnapshots.id))
     .limit(limit)
+}
+
+// ─── Product Research sessions ────────────────────────────────────────────────
+
+export type ResearchWindowInput = {
+  period: Period
+  avgSoldPrice: number | null
+  avgShipping: number | null
+  totalSold: number | null
+  soldPriceMin?: number | null
+  soldPriceMax?: number | null
+  totalSellers?: number | null
+  sellThroughPct?: number | null
+  freeShippingPct?: number | null
+}
+
+/**
+ * Saves one eBay Product Research event atomically.
+ *
+ * The parent session and every supplied lookback window are inserted by one
+ * Postgres statement. Legacy/manual rows that predate this model remain
+ * ungrouped with a null research_session_id.
+ */
+export async function saveMarketResearchSession(input: {
+  partId: number
+  researchedAt?: Date
+  source?: string
+  notes?: string | null
+  windows: ResearchWindowInput[]
+}): Promise<number> {
+  if (input.windows.length === 0) {
+    throw new Error('A research session must contain at least one lookback window')
+  }
+
+  const periods = input.windows.map((window) => window.period)
+  if (new Set(periods).size !== periods.length) {
+    throw new Error('A research session cannot contain duplicate lookback windows')
+  }
+
+  const researchedAt = input.researchedAt ?? new Date()
+  const source = input.source?.trim() || 'ebay_product_research_manual'
+  const notes = input.notes?.trim() || null
+
+  await db.execute(sql`
+    WITH inserted_session AS (
+      INSERT INTO ${marketResearchSessions}
+        (part_id, researched_at, source, notes, created_at)
+      VALUES
+        (${input.partId}, ${researchedAt}, ${source}, ${notes}, now())
+      RETURNING id, researched_at
+    ),
+    window_input(
+      period, price, shipping, sold_qty, sold_price_min, sold_price_max,
+      total_sellers, sell_through_pct, free_shipping_pct
+    ) AS (
+      VALUES ${sql.join(
+        input.windows.map(
+          (window) => sql`(
+            ${window.period}::period,
+            ${toDbNumeric(window.avgSoldPrice)}::numeric(10,2),
+            ${toDbNumeric(window.avgShipping)}::numeric(10,2),
+            ${window.totalSold}::integer,
+            ${toDbNumeric(window.soldPriceMin)}::numeric(10,2),
+            ${toDbNumeric(window.soldPriceMax)}::numeric(10,2),
+            ${window.totalSellers ?? null}::integer,
+            ${toDbNumeric(window.sellThroughPct)}::numeric(8,2),
+            ${toDbNumeric(window.freeShippingPct)}::numeric(5,2)
+          )`,
+        ),
+        sql`, `,
+      )}
+    ),
+    inserted_windows AS (
+      INSERT INTO ${marketSnapshots}
+        (part_id, research_session_id, period, price, shipping, sold_qty,
+         sold_price_min, sold_price_max, total_sellers, sell_through_pct,
+         free_shipping_pct, source, price_basis, sample_size, captured_at)
+      SELECT
+        ${input.partId}, s.id, w.period, w.price, w.shipping, w.sold_qty,
+        w.sold_price_min, w.sold_price_max, w.total_sellers, w.sell_through_pct,
+        w.free_shipping_pct, 'manual'::snapshot_source, 'sold'::price_basis,
+        NULL, s.researched_at
+      FROM inserted_session s
+      CROSS JOIN window_input w
+      RETURNING 1
+    )
+    SELECT count(*)::int AS written FROM inserted_windows
+  `)
+
+  return input.windows.length
+}
+
+export async function researchSessionHistory(
+  partId: number,
+  limit = 100,
+): Promise<MarketResearchSession[]> {
+  const sessions = await db
+    .select()
+    .from(marketResearchSessions)
+    .where(eq(marketResearchSessions.partId, partId))
+    .orderBy(desc(marketResearchSessions.researchedAt), desc(marketResearchSessions.id))
+    .limit(limit)
+
+  if (sessions.length === 0) return []
+
+  const ids = sessions.map((session) => session.id)
+  const windows = await db
+    .select({
+      researchSessionId: marketSnapshots.researchSessionId,
+      period: marketSnapshots.period,
+      price: marketSnapshots.price,
+      shipping: marketSnapshots.shipping,
+      soldQty: marketSnapshots.soldQty,
+      soldPriceMin: marketSnapshots.soldPriceMin,
+      soldPriceMax: marketSnapshots.soldPriceMax,
+      totalSellers: marketSnapshots.totalSellers,
+      sellThroughPct: marketSnapshots.sellThroughPct,
+      freeShippingPct: marketSnapshots.freeShippingPct,
+      source: marketSnapshots.source,
+      priceBasis: marketSnapshots.priceBasis,
+      sampleSize: marketSnapshots.sampleSize,
+      capturedAt: marketSnapshots.capturedAt,
+    })
+    .from(marketSnapshots)
+    .where(inArray(marketSnapshots.researchSessionId, ids))
+    .orderBy(desc(marketSnapshots.capturedAt), marketSnapshots.period)
+
+  const bySession = new Map<number, Partial<Record<Period, PeriodObservation>>>()
+  for (const window of windows) {
+    if (window.researchSessionId == null) continue
+    const periods = bySession.get(window.researchSessionId) ?? {}
+    periods[window.period as Period] = mapObservation(window)
+    bySession.set(window.researchSessionId, periods)
+  }
+
+  return sessions.map((session) => ({
+    id: session.id,
+    partId: session.partId,
+    researchedAt: session.researchedAt.toISOString(),
+    source: session.source,
+    notes: session.notes,
+    createdAt: session.createdAt.toISOString(),
+    periods: bySession.get(session.id) ?? {},
+  }))
 }
 
 // ─── Explicit manual save ─────────────────────────────────────────────────────

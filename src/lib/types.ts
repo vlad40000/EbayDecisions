@@ -39,6 +39,12 @@ export type PeriodObservation = {
   shipping: number | null
   /** Units sold inside this lookback window. Never active-listing count. */
   soldQty: number | null
+  soldPriceMin?: number | null
+  soldPriceMax?: number | null
+  totalSellers?: number | null
+  sellThroughPct?: number | null
+  freeShippingPct?: number | null
+  researchSessionId?: number | null
   source: SnapshotSource
   priceBasis: PriceBasis
   sampleSize: number | null
@@ -87,6 +93,16 @@ export type PartWithMarket = Part & {
   periods: Partial<Record<Period, PeriodObservation>>
   /** Newest point-in-time active competition observation. */
   activeMarket: ActiveMarketObservation | null
+}
+
+export type MarketResearchSession = {
+  id: number
+  partId: number
+  researchedAt: string
+  source: string
+  notes: string | null
+  createdAt: string
+  periods: Partial<Record<Period, PeriodObservation>>
 }
 
 export type TrendBasis = 'history' | 'window-curve' | 'window-velocity' | 'insufficient'

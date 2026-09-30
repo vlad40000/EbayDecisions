@@ -19,13 +19,15 @@ import {
   listParts,
   listPartsWithMarket,
   loadTrendSummaries,
+  researchSessionHistory,
   saveManualMarket,
+  saveMarketResearchSession,
   snapshotHistory,
   updatePart,
   updateSettings,
   upsertPartByMpn,
 } from '@/db/queries'
-import { activeMarketSnapshots, marketSnapshots } from '@/db/schema'
+import { activeMarketSnapshots, marketResearchSessions, marketSnapshots } from '@/db/schema'
 
 const client = new PGlite()
 const testDb = drizzle({ client, schema })
@@ -62,6 +64,7 @@ describe('migrations', () => {
     expect(result.rows.map((row) => row.table_name)).toEqual([
       'active_market_snapshots',
       'ebay_sync_runs',
+      'market_research_sessions',
       'market_snapshots',
       'parts',
       'settings',
@@ -84,13 +87,15 @@ describe('migrations', () => {
         (${id}, '1yr', 80, 8, 99, 'manual', null)
     `)
     await applySql(files[2]!)
+    await applySql(files[3]!)
 
-    const sold = await client.query<{ source: string; sold_qty: number | null; legacy_qty: number | null; price_basis: string }>(
-      `select source, sold_qty, legacy_qty, price_basis from market_snapshots order by period`,
+    const sold = await client.query<{ source: string; sold_qty: number | null; legacy_qty: number | null; price_basis: string; research_session_id: number | null }>(
+      `select source, sold_qty, legacy_qty, price_basis, research_session_id from market_snapshots order by period`,
     )
     expect(sold.rows.some((row) => row.source === 'ebay_insights' && row.sold_qty === 8 && row.price_basis === 'sold')).toBe(true)
     expect(sold.rows.some((row) => row.source === 'ebay_browse')).toBe(false)
     expect(sold.rows.some((row) => row.source === 'manual' && row.sold_qty == null && row.legacy_qty === 99)).toBe(true)
+    expect(sold.rows.every((row) => row.research_session_id == null)).toBe(true)
 
     const active = await client.query<{ active_qty: number | null; source: string }>(
       `select active_qty, source from active_market_snapshots`,
@@ -171,6 +176,80 @@ describe('separate sold and active market streams', () => {
     await deletePart(part.id)
     expect(await testDb.select().from(marketSnapshots)).toHaveLength(0)
     expect(await testDb.select().from(activeMarketSnapshots)).toHaveLength(0)
+  })
+})
+
+describe('Product Research sessions', () => {
+  it('groups the five lookback windows under one dated session and preserves optional metrics', async () => {
+    const part = await createPart({ mpn: 'R1', description: 'Board' })
+    const written = await saveMarketResearchSession({
+      partId: part.id,
+      researchedAt: new Date('2026-09-30T15:00:00Z'),
+      windows: [
+        { period: '7d', avgSoldPrice: 65, avgShipping: 9, totalSold: 8, soldPriceMin: 50, soldPriceMax: 80, totalSellers: 5, sellThroughPct: 160, freeShippingPct: 25 },
+        { period: '30d', avgSoldPrice: 60, avgShipping: 10, totalSold: 20 },
+        { period: '90d', avgSoldPrice: 58, avgShipping: 11, totalSold: 50 },
+        { period: '6m', avgSoldPrice: 57, avgShipping: 12, totalSold: 90 },
+        { period: '1yr', avgSoldPrice: 55, avgShipping: 12, totalSold: 180 },
+      ],
+    })
+
+    expect(written).toBe(5)
+    const sessions = await researchSessionHistory(part.id)
+    expect(sessions).toHaveLength(1)
+    expect(sessions[0]?.researchedAt).toBe('2026-09-30T15:00:00.000Z')
+    expect(sessions[0]?.periods['7d']?.soldQty).toBe(8)
+    expect(sessions[0]?.periods['7d']?.soldPriceMin).toBe(50)
+    expect(sessions[0]?.periods['7d']?.totalSellers).toBe(5)
+    expect(sessions[0]?.periods['7d']?.sellThroughPct).toBe(160)
+    expect(sessions[0]?.periods['30d']?.soldPriceMin).toBeNull()
+
+    const rawSessions = await testDb.select().from(marketResearchSessions)
+    const rawSnapshots = await testDb.select().from(marketSnapshots)
+    expect(rawSessions).toHaveLength(1)
+    expect(rawSnapshots).toHaveLength(5)
+    expect(rawSnapshots.every((row) => row.researchSessionId === rawSessions[0]?.id)).toBe(true)
+  })
+
+  it('appends later research without overwriting the earlier session', async () => {
+    const part = await createPart({ mpn: 'R2', description: 'Board' })
+    await saveMarketResearchSession({
+      partId: part.id,
+      researchedAt: new Date('2026-09-01T12:00:00Z'),
+      windows: [{ period: '30d', avgSoldPrice: 50, avgShipping: 10, totalSold: 10 }],
+    })
+    await saveMarketResearchSession({
+      partId: part.id,
+      researchedAt: new Date('2026-09-30T12:00:00Z'),
+      windows: [{ period: '30d', avgSoldPrice: 60, avgShipping: 11, totalSold: 18 }],
+    })
+
+    const sessions = await researchSessionHistory(part.id)
+    expect(sessions).toHaveLength(2)
+    expect(sessions[0]?.periods['30d']?.price).toBe(60)
+    expect(sessions[1]?.periods['30d']?.price).toBe(50)
+    expect(await snapshotHistory(part.id)).toHaveLength(2)
+  })
+
+  it('keeps legacy/sync snapshots ungrouped and rejects duplicate windows before writing', async () => {
+    const part = await createPart({ mpn: 'R3', description: 'Board' })
+    await insertSoldSnapshots([
+      { partId: part.id, period: '7d', price: 10, shipping: 1, soldQty: 2, source: 'ebay_insights', sampleSize: 2 },
+    ])
+    expect((await snapshotHistory(part.id))[0]?.researchSessionId).toBeNull()
+
+    await expect(
+      saveMarketResearchSession({
+        partId: part.id,
+        windows: [
+          { period: '30d', avgSoldPrice: 20, avgShipping: 2, totalSold: 3 },
+          { period: '30d', avgSoldPrice: 21, avgShipping: 2, totalSold: 4 },
+        ],
+      }),
+    ).rejects.toThrow('duplicate lookback windows')
+
+    expect(await testDb.select().from(marketResearchSessions)).toHaveLength(0)
+    expect(await snapshotHistory(part.id)).toHaveLength(1)
   })
 })
 
