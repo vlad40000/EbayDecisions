@@ -231,7 +231,7 @@ describe('decision semantics', () => {
 
   it('does not act on history that is too short', () => {
     const result = decide(
-      part({ costBasis: 60, periods: flatMarket(70, 0) }),
+      part({ costBasis: 45, periods: flatMarket(70, 0) }),
       SETTINGS,
       summary({ marketPctPer30d: -50, marketPoints: 3, marketSpanDays: 2, marketPeriod: '30d' }),
     )
