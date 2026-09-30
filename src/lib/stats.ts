@@ -80,23 +80,29 @@ export function timeTrend(
   const minPoints = options.minPoints ?? 3
   const minSpanDays = options.minSpanDays ?? 14
 
-  const byDay = new Map<string, { at: number; value: number }>()
+  const byDay = new Map<string, { observedAt: number; dayAt: number; value: number }>()
   for (const point of input) {
     if (point.value == null || !Number.isFinite(point.value)) continue
-    const at = point.at instanceof Date ? point.at.getTime() : new Date(point.at).getTime()
-    if (!Number.isFinite(at)) continue
-    const day = new Date(at).toISOString().slice(0, 10)
+    const observedAt = point.at instanceof Date ? point.at.getTime() : new Date(point.at).getTime()
+    if (!Number.isFinite(observedAt)) continue
+    const day = new Date(observedAt).toISOString().slice(0, 10)
+    const dayAt = Date.parse(`${day}T00:00:00.000Z`)
     const existing = byDay.get(day)
-    if (!existing || at >= existing.at) byDay.set(day, { at, value: point.value })
+    // Keep the latest correction's value, but anchor regression x to the UTC
+    // calendar date. A correction at 4pm instead of 8am must not shorten a
+    // nominal 14/28-day history span or shift the fitted timing signal.
+    if (!existing || observedAt >= existing.observedAt) {
+      byDay.set(day, { observedAt, dayAt, value: point.value })
+    }
   }
 
-  const values = [...byDay.values()].sort((a, b) => a.at - b.at)
+  const values = [...byDay.values()].sort((a, b) => a.dayAt - b.dayAt)
   if (values.length < 2) return { ...EMPTY_TREND, points: values.length }
 
-  const first = values[0]!.at
-  const last = values[values.length - 1]!.at
+  const first = values[0]!.dayAt
+  const last = values[values.length - 1]!.dayAt
   const spanDays = (last - first) / DAY_MS
-  const points = values.map((point) => ({ x: (point.at - first) / DAY_MS, y: point.value }))
+  const points = values.map((point) => ({ x: (point.dayAt - first) / DAY_MS, y: point.value }))
   return fit(points, values.length >= minPoints && spanDays >= minSpanDays, spanDays)
 }
 
