@@ -1,0 +1,102 @@
+@import 'tailwindcss';
+
+/* Carried over from the Figma Make prototype so the app still looks like the
+   thing you designed. Dark-only by intent: this is a back-office tool that
+   lives on one screen next to eBay listings. */
+@theme {
+  /* Bundled from npm in the root layout — see the import comment there. */
+  --font-sans: 'Work Sans Variable', 'Work Sans', system-ui, sans-serif;
+  --font-mono: 'DM Mono', ui-monospace, 'Courier New', monospace;
+
+  --color-bg: #08090d;
+  --color-surface: #0e1018;
+  --color-surface-2: #131520;
+  --color-line: #1c2030;
+  --color-line-bright: #2a3048;
+
+  --color-ink: #dde1ea;
+  --color-ink-dim: #8b92a8;
+  --color-ink-faint: #545d72;
+  --color-ink-ghost: #2a3048;
+
+  --color-good: #22c55e;
+  --color-info: #3b82f6;
+  --color-warn: #f59e0b;
+  --color-bad: #ef4444;
+  --color-hold: #a78bfa;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  background-color: var(--color-bg);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  margin: 0;
+  min-height: 100dvh;
+  background-color: var(--color-bg);
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-line);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-line-bright);
+}
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line) transparent;
+}
+
+input[type='number']::-webkit-inner-spin-button,
+input[type='number']::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type='number'] {
+  -moz-appearance: textfield;
+}
+
+/* Every interactive element gets a visible focus ring — this app is driven
+   largely by keyboard when filling in the tracker grid. */
+:focus-visible {
+  outline: 2px solid var(--color-good);
+  outline-offset: 1px;
+}
+
+@utility field {
+  background: var(--color-surface);
+  border: 1px solid var(--color-line);
+  color: var(--color-ink);
+  border-radius: 0.25rem;
+  transition: border-color 120ms ease;
+}
+@utility field-focus {
+  border-color: var(--color-good);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
