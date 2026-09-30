@@ -9,7 +9,6 @@ import {
   type ResearchWindowFormInput,
 } from '@/app/(app)/tracker/actions'
 import { Chip, EmptyState } from '@/components/ui'
-import { money } from '@/lib/format'
 import { PERIODS, PERIOD_LABELS, type Period, type PeriodObservation } from '@/lib/types'
 
 export type ResearchTrackerRow = {
