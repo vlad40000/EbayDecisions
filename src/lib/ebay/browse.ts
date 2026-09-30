@@ -1,23 +1,11 @@
-/**
- * Browse API adapter — the *active listings* view.
- *
- * What this gives you: what other sellers are currently asking, and how many are
- * competing with you right now. That second number is genuinely useful; the
- * first is not a comp. An unsold listing at $200 is evidence of one seller's
- * hope, not of what the part fetches.
- *
- * So every row this adapter writes is stamped `ebay_browse`, the UI labels it
- * "Active listings", and the decision engine flags any part whose entire read
- * rests on asking prices. Use Insights for real sold comps when eBay grants your
- * app that scope.
- */
+/** Active-listing adapter. Never presented as sold comps. */
 import { median } from '../stats'
-import type { Period } from '../types'
-
 import { ebayGet, getEbayConfig, type EbayConfig } from './client'
+import { titleMatchesMpn } from './match'
 
 type BrowseItemSummary = {
   itemId?: string
+  title?: string
   price?: { value?: string; currency?: string }
   shippingOptions?: { shippingCost?: { value?: string } }[]
   condition?: string
@@ -29,19 +17,28 @@ type BrowseResponse = {
 }
 
 export type BrowseResult = {
-  /** Median asking price across active listings. */
-  price: number | null
-  /** Median shipping charged. Free shipping counts as 0, not as missing. */
-  shipping: number | null
-  /** How many active listings matched — your competition. */
-  activeCount: number | null
+  askingPrice: number | null
+  askingShipping: number | null
+  /** Exact active count only when the broad result set fit in the inspected page. */
+  activeQty: number | null
   sampleSize: number
+  broadMatchCount: number | null
+  mpnRejectedCount: number
+  conditionRejectedCount: number
+  truncated: boolean
 }
 
-const PAGE_LIMIT = 100
+const PAGE_LIMIT = 200
 
-/** Browse only describes right now, so it fills the shortest window. */
-export const BROWSE_TARGET_PERIOD: Period = '7d'
+function isUsedCondition(condition: string | undefined): boolean {
+  if (!condition) return false
+  const normalized = condition.toLowerCase()
+  return (
+    normalized.includes('used') ||
+    normalized.includes('pre-owned') ||
+    normalized.includes('preowned')
+  )
+}
 
 export async function fetchActiveMarket(
   mpn: string,
@@ -49,33 +46,48 @@ export async function fetchActiveMarket(
 ): Promise<BrowseResult> {
   const response = await ebayGet<BrowseResponse>(
     '/buy/browse/v1/item_summary/search',
-    { q: mpn, limit: String(PAGE_LIMIT) },
+    {
+      q: mpn,
+      limit: String(PAGE_LIMIT),
+      // eBay supports the broad USED condition filter for Browse and Insights.
+      // We still check the returned condition defensively.
+      filter: 'conditions:{USED}',
+    },
     config.browseScope,
     config,
   )
 
-  const summaries = response.itemSummaries ?? []
+  const returned = response.itemSummaries ?? []
+  const exactMpn = returned.filter((item) => item.title && titleMatchesMpn(item.title, mpn))
+  const qualified = exactMpn.filter((item) => isUsedCondition(item.condition))
 
   const prices: number[] = []
   const shippingCosts: number[] = []
-
-  for (const item of summaries) {
+  for (const item of qualified) {
     const price = Number(item.price?.value)
     if (Number.isFinite(price) && price > 0) prices.push(price)
 
-    // Absent shippingOptions means eBay did not say; absent cost within a
-    // present option means free. Only the latter is a real zero.
     const option = item.shippingOptions?.[0]
     if (option) {
       const shipping = Number(option.shippingCost?.value ?? '0')
-      if (Number.isFinite(shipping)) shippingCosts.push(shipping)
+      if (Number.isFinite(shipping) && shipping >= 0) shippingCosts.push(shipping)
     }
   }
 
+  const broadMatchCount = typeof response.total === 'number' ? response.total : null
+  const truncated = broadMatchCount != null && broadMatchCount > returned.length
+
   return {
-    price: median(prices),
-    shipping: median(shippingCosts),
-    activeCount: typeof response.total === 'number' ? response.total : null,
+    askingPrice: median(prices),
+    askingShipping: median(shippingCosts),
+    // If the broad search is truncated, counting exact matches in only the first
+    // page would silently understate competition. Preserve price sample, but do
+    // not claim an exact active count.
+    activeQty: truncated ? null : qualified.length,
     sampleSize: prices.length,
+    broadMatchCount,
+    mpnRejectedCount: returned.length - exactMpn.length,
+    conditionRejectedCount: exactMpn.length - qualified.length,
+    truncated,
   }
 }

@@ -22,54 +22,57 @@ const optionalAmount = z
     message: `That is over ${MAX_AMOUNT.toLocaleString()} — check for a typo.`,
   })
 
-const fieldSchema = z.discriminatedUnion('field', [
-  z.object({
-    field: z.literal('costBasis'),
+const partFieldsSchema = z
+  .object({
     partId: z.coerce.number().int().positive(),
-    value: optionalAmount,
-  }),
-  z.object({
-    field: z.literal('shipCost'),
-    partId: z.coerce.number().int().positive(),
-    value: optionalAmount,
-  }),
-  z.object({
-    field: z.literal('targetMarginPct'),
-    partId: z.coerce.number().int().positive(),
-    value: optionalAmount.refine((value) => value === null || value < 100, {
-      message: 'A target margin of 100% or more is not reachable.',
-    }),
-  }),
-  z.object({
-    field: z.literal('inventoryQty'),
-    partId: z.coerce.number().int().positive(),
-    value: optionalAmount.refine((value) => value !== null, {
-      message: 'Quantity is required — use 0 for none on hand.',
-    }),
-  }),
-])
+    inventoryQty: optionalAmount
+      .refine((value) => value !== null, {
+        message: 'Quantity is required — use 0 for none on hand.',
+      })
+      .optional(),
+    costBasis: optionalAmount.optional(),
+    shipCost: optionalAmount.optional(),
+    targetMarginPct: optionalAmount
+      .refine((value) => value === null || value < 100, {
+        message: 'A target margin of 100% or more is not reachable.',
+      })
+      .optional(),
+  })
+  .refine(
+    (value) =>
+      value.inventoryQty !== undefined ||
+      value.costBasis !== undefined ||
+      value.shipCost !== undefined ||
+      value.targetMarginPct !== undefined,
+    { message: 'Nothing changed for this part.' },
+  )
 
-/** Inline edit of one numeric field on one part. */
-export async function savePartField(input: {
+export type PartFieldsInput = {
   partId: number
-  field: string
-  value: string
-}): Promise<ActionResult> {
-  await requireSession()
+  inventoryQty?: string
+  costBasis?: string
+  shipCost?: string
+  targetMarginPct?: string
+}
 
-  const parsed = fieldSchema.safeParse(input)
+/** Explicit per-row inventory save. One button press becomes one UPDATE. */
+export async function savePartFields(input: PartFieldsInput): Promise<ActionResult> {
+  await requireSession()
+  const parsed = partFieldsSchema.safeParse(input)
   if (!parsed.success) {
     return { ok: false, error: parsed.error.issues[0]?.message ?? 'That value is not valid.' }
   }
 
-  const { partId, field, value } = parsed.data
-
+  const { partId, ...values } = parsed.data
   try {
-    if (field === 'inventoryQty') {
-      await updatePart(partId, { inventoryQty: Math.round(value ?? 0) })
-    } else {
-      await updatePart(partId, { [field]: value })
-    }
+    await updatePart(partId, {
+      ...(values.inventoryQty !== undefined
+        ? { inventoryQty: Math.round(values.inventoryQty ?? 0) }
+        : {}),
+      ...(values.costBasis !== undefined ? { costBasis: values.costBasis } : {}),
+      ...(values.shipCost !== undefined ? { shipCost: values.shipCost } : {}),
+      ...(values.targetMarginPct !== undefined ? { targetMarginPct: values.targetMarginPct } : {}),
+    })
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : 'Could not save.' }
   }

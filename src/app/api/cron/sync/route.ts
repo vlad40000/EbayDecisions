@@ -1,5 +1,5 @@
-import { NextResponse, type NextRequest } from 'next/server'
 import { timingSafeEqual } from 'node:crypto'
+import { NextResponse, type NextRequest } from 'next/server'
 
 import { runSync } from '@/lib/ebay/sync'
 
@@ -16,25 +16,24 @@ function tokenMatches(provided: string, expected: string): boolean {
 }
 
 /**
- * Scheduled sync. Vercel Cron issues a GET with
- * `Authorization: Bearer $CRON_SECRET`.
- *
- * This route is excluded from the session proxy, so CRON_SECRET is the only
- * thing standing in front of it. If it is unset the route refuses outright
- * rather than defaulting open.
+ * Scheduled sync is opt-in. Vercel may still invoke this route from vercel.json,
+ * but with EBAY_CRON_ENABLED unset/false it returns before touching Neon.
  */
 export async function GET(request: NextRequest) {
+  if (process.env.EBAY_CRON_ENABLED !== 'true') {
+    return NextResponse.json({ status: 'skipped', message: 'Scheduled eBay sync is disabled.' })
+  }
+
   const expected = process.env.CRON_SECRET
   if (!expected) {
     return NextResponse.json(
-      { error: 'CRON_SECRET is not set on the server, so scheduled sync is disabled.' },
+      { error: 'CRON_SECRET is not set, so scheduled sync is disabled.' },
       { status: 503 },
     )
   }
 
   const header = request.headers.get('authorization') ?? ''
   const provided = header.startsWith('Bearer ') ? header.slice(7) : ''
-
   if (!provided || !tokenMatches(provided, expected)) {
     return NextResponse.json({ error: 'Unauthorized.' }, { status: 401 })
   }

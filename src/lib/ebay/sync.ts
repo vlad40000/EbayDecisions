@@ -1,28 +1,19 @@
-/**
- * Sync orchestrator.
- *
- * Picks an adapter, walks the active parts, writes snapshots, and records the run
- * so a failure at 3am is visible at 8am instead of silent.
- *
- * Adapter selection, when EBAY_ADAPTER is "auto": try Insights (real sold comps)
- * and fall back to Browse (active listings) if the Insights scope has not been
- * granted. The fallback is reported in the run row, so you can always tell which
- * kind of data a given night produced.
- */
 import 'server-only'
 
 import {
   finishSyncRun,
-  insertSnapshots,
+  insertActiveSnapshots,
+  insertSoldSnapshots,
   listParts,
   startSyncRun,
-  type SyncSnapshot,
+  type SyncActiveSnapshot,
+  type SyncSoldSnapshot,
 } from '@/db/queries'
 
 import type { Period } from '../types'
-import { BROWSE_TARGET_PERIOD, fetchActiveMarket } from './browse'
+import { fetchActiveMarket } from './browse'
 import { EbayError, getEbayConfig, isEbayConfigured, type EbayAdapterName } from './client'
-import { fetchSoldWindows } from './insights'
+import { fetchSoldWindows, type SoldWindowsResult } from './insights'
 
 export type SyncResult = {
   runId: number | null
@@ -31,38 +22,35 @@ export type SyncResult = {
   partsProcessed: number
   partsFailed: number
   snapshotsWritten: number
+  soldSnapshotsWritten: number
+  activeSnapshotsWritten: number
   message: string
   failures: { mpn: string; error: string }[]
 }
 
-/** Courtesy pause between parts so a 100-part run does not look like a flood. */
 const REQUEST_SPACING_MS = 250
-
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
-/**
- * Decides which adapter to run by actually trying the preferred one.
- *
- * Probing beats guessing: whether the Insights scope is granted is a fact about
- * eBay's records, not something readable from config.
- */
-async function resolveAdapter(sampleMpn: string): Promise<{
+type ResolvedAdapter = {
   adapter: EbayAdapterName
   note: string
-}> {
-  const config = getEbayConfig()
+  firstSoldResult?: SoldWindowsResult
+}
 
+/** Probe actual scope access instead of guessing from configuration. */
+async function resolveAdapter(sampleMpn: string): Promise<ResolvedAdapter> {
+  const config = getEbayConfig()
   if (config.adapter === 'browse') return { adapter: 'browse', note: 'Browse (configured)' }
   if (config.adapter === 'insights') return { adapter: 'insights', note: 'Insights (configured)' }
 
   try {
-    await fetchSoldWindows(sampleMpn, config)
-    return { adapter: 'insights', note: 'Insights (sold comps)' }
+    const firstSoldResult = await fetchSoldWindows(sampleMpn, config)
+    return { adapter: 'insights', note: 'Insights (sold comps)', firstSoldResult }
   } catch (error) {
     const reason = error instanceof EbayError ? `HTTP ${error.status ?? '?'}` : 'error'
     return {
       adapter: 'browse',
-      note: `Browse (Insights unavailable: ${reason} — active listings only)`,
+      note: `Browse (Insights unavailable: ${reason}; active listings only)`,
     }
   }
 }
@@ -74,6 +62,8 @@ export async function runSync(trigger: 'cron' | 'manual'): Promise<SyncResult> {
     partsProcessed: 0,
     partsFailed: 0,
     snapshotsWritten: 0,
+    soldSnapshotsWritten: 0,
+    activeSnapshotsWritten: 0,
     failures: [],
   }
 
@@ -81,63 +71,76 @@ export async function runSync(trigger: 'cron' | 'manual'): Promise<SyncResult> {
     return {
       ...empty,
       status: 'skipped',
-      message:
-        'eBay credentials are not set, so there is nothing to sync. Add EBAY_CLIENT_ID and EBAY_CLIENT_SECRET, or keep entering market data in the Tracker.',
+      message: 'eBay credentials are not set. Manual market entry remains available.',
     }
   }
 
   const config = getEbayConfig()
   const allParts = await listParts()
-
   if (allParts.length === 0) {
-    return { ...empty, status: 'skipped', message: 'No active parts to sync. Run `pnpm db:seed` first.' }
+    return { ...empty, status: 'skipped', message: 'No active parts to sync.' }
   }
 
   const batch = allParts.slice(0, config.syncLimit)
   const runId = await startSyncRun(trigger)
 
-  let adapter: EbayAdapterName
-  let adapterNote: string
+  let resolved: ResolvedAdapter
   try {
-    const resolved = await resolveAdapter(batch[0]?.mpn ?? '')
-    adapter = resolved.adapter
-    adapterNote = resolved.note
+    resolved = await resolveAdapter(batch[0]?.mpn ?? '')
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     await finishSyncRun(runId, { status: 'failed', error: message })
     return { ...empty, runId, status: 'failed', message: `Could not reach eBay: ${message}` }
   }
 
-  const snapshots: SyncSnapshot[] = []
+  const soldSnapshots: SyncSoldSnapshot[] = []
+  const activeSnapshots: SyncActiveSnapshot[] = []
   const failures: { mpn: string; error: string }[] = []
+  const notes = new Set<string>()
   let processed = 0
 
-  for (const part of batch) {
+  for (let index = 0; index < batch.length; index += 1) {
+    const part = batch[index]!
     try {
-      if (adapter === 'insights') {
-        const windows = await fetchSoldWindows(part.mpn, config)
-        for (const [period, aggregate] of Object.entries(windows)) {
+      if (resolved.adapter === 'insights') {
+        const result = index === 0 && resolved.firstSoldResult
+          ? resolved.firstSoldResult
+          : await fetchSoldWindows(part.mpn, config)
+
+        if (!result.exactMpnVerified) {
+          notes.add('Insights did not expose titles for every returned sale, so sold MPN qualification relied on eBay keyword search plus USED condition filtering.')
+        }
+        if (result.truncated) {
+          notes.add('At least one Insights result exceeded one response page; sold counts for truncated samples were left unknown rather than undercounted.')
+        }
+
+        for (const [period, aggregate] of Object.entries(result.windows)) {
           if (!aggregate) continue
-          snapshots.push({
+          soldSnapshots.push({
             partId: part.id,
             period: period as Period,
             price: aggregate.price,
             shipping: aggregate.shipping,
-            qty: aggregate.qty,
+            soldQty: aggregate.soldQty,
             source: 'ebay_insights',
             sampleSize: aggregate.sampleSize,
           })
         }
       } else {
         const active = await fetchActiveMarket(part.mpn, config)
-        snapshots.push({
+        if (active.truncated) {
+          notes.add('At least one Browse result was truncated; its active-listing count was left unknown rather than undercounted.')
+        }
+        activeSnapshots.push({
           partId: part.id,
-          period: BROWSE_TARGET_PERIOD,
-          price: active.price,
-          shipping: active.shipping,
-          qty: active.activeCount,
-          source: 'ebay_browse',
+          askingPrice: active.askingPrice,
+          askingShipping: active.askingShipping,
+          activeQty: active.activeQty,
           sampleSize: active.sampleSize,
+          broadMatchCount: active.broadMatchCount,
+          mpnRejectedCount: active.mpnRejectedCount,
+          conditionRejectedCount: active.conditionRejectedCount,
+          truncated: active.truncated,
         })
       }
       processed += 1
@@ -148,17 +151,21 @@ export async function runSync(trigger: 'cron' | 'manual'): Promise<SyncResult> {
       })
     }
 
-    await sleep(REQUEST_SPACING_MS)
+    if (index < batch.length - 1) await sleep(REQUEST_SPACING_MS)
   }
 
-  let written = 0
+  let soldWritten = 0
+  let activeWritten = 0
   try {
-    written = await insertSnapshots(snapshots)
+    // Only one adapter runs per sync, so normally only one of these performs a
+    // database statement. Empty batches are no-ops.
+    soldWritten = await insertSoldSnapshots(soldSnapshots)
+    activeWritten = await insertActiveSnapshots(activeSnapshots)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     await finishSyncRun(runId, {
       status: 'failed',
-      adapter,
+      adapter: resolved.adapter,
       partsProcessed: processed,
       partsFailed: failures.length,
       error: `Fetched market data but the write failed: ${message}`,
@@ -166,50 +173,51 @@ export async function runSync(trigger: 'cron' | 'manual'): Promise<SyncResult> {
     return {
       runId,
       status: 'failed',
-      adapter,
+      adapter: resolved.adapter,
       partsProcessed: processed,
       partsFailed: failures.length,
       snapshotsWritten: 0,
+      soldSnapshotsWritten: 0,
+      activeSnapshotsWritten: 0,
       message: `Fetched ${processed} parts but could not save: ${message}`,
       failures,
     }
   }
 
+  const written = soldWritten + activeWritten
   const status = failures.length === 0 ? 'success' : processed > 0 ? 'partial' : 'failed'
-
   await finishSyncRun(runId, {
     status,
-    adapter,
+    adapter: resolved.adapter,
     partsProcessed: processed,
     partsFailed: failures.length,
     snapshotsWritten: written,
+    soldSnapshotsWritten: soldWritten,
+    activeSnapshotsWritten: activeWritten,
     error:
       failures.length > 0
-        ? failures
-            .slice(0, 10)
-            .map((f) => `${f.mpn}: ${f.error}`)
-            .join('; ')
+        ? failures.slice(0, 10).map((failure) => `${failure.mpn}: ${failure.error}`).join('; ')
         : null,
   })
 
   const skipped = allParts.length - batch.length
-  const parts: string[] = [
-    `${adapterNote}: ${processed} of ${batch.length} parts, ${written} snapshots written.`,
+  const messageParts = [
+    `${resolved.note}: ${processed} of ${batch.length} parts, ${written} observations written.`,
   ]
-  if (failures.length > 0) parts.push(`${failures.length} failed.`)
-  if (skipped > 0) parts.push(`${skipped} parts skipped by EBAY_SYNC_LIMIT.`)
-  if (adapter === 'browse') {
-    parts.push('These are active-listing asking prices, not sold comps.')
-  }
+  if (failures.length > 0) messageParts.push(`${failures.length} failed.`)
+  if (skipped > 0) messageParts.push(`${skipped} skipped by EBAY_SYNC_LIMIT.`)
+  for (const note of notes) messageParts.push(note)
 
   return {
     runId,
     status,
-    adapter,
+    adapter: resolved.adapter,
     partsProcessed: processed,
     partsFailed: failures.length,
     snapshotsWritten: written,
-    message: parts.join(' '),
+    soldSnapshotsWritten: soldWritten,
+    activeSnapshotsWritten: activeWritten,
+    message: messageParts.join(' '),
     failures,
   }
 }

@@ -1,19 +1,30 @@
 'use client'
 
 import Link from 'next/link'
+import { useRouter } from 'next/navigation'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
-import { saveMarketWindows, type WindowInput } from '@/app/(app)/tracker/actions'
+import { saveMarketPart, type ActiveInput, type WindowInput } from '@/app/(app)/tracker/actions'
 import { money, relativeTime } from '@/lib/format'
-import { PERIODS, PERIOD_LABELS, type Period, type SnapshotSource } from '@/lib/types'
+import {
+  PERIODS,
+  PERIOD_LABELS,
+  PRICE_BASIS_LABELS,
+  type ActiveMarketObservation,
+  type Period,
+  type PriceBasis,
+  type SnapshotSource,
+} from '@/lib/types'
 
-import { EmptyState, SourceBadge } from './ui'
+import { Chip, EmptyState, SourceBadge } from './ui'
 
 export type GridPeriod = {
   price: number | null
   shipping: number | null
-  qty: number | null
+  soldQty: number | null
   source: SnapshotSource
+  priceBasis: PriceBasis
+  sampleSize: number | null
   capturedAt: string
 }
 
@@ -23,156 +34,59 @@ export type GridRow = {
   description: string
   inventoryQty: number
   periods: Partial<Record<Period, GridPeriod>>
+  activeMarket: ActiveMarketObservation | null
 }
-
-type Field = 'price' | 'shipping' | 'qty'
-const FIELDS: Field[] = ['price', 'shipping', 'qty']
-
-/**
- * Long enough that typing across a part's fifteen cells settles into one save,
- * short enough that a save still feels immediate when you move on.
- */
-const DEBOUNCE_MS = 900
 
 type PartState = 'idle' | 'saving' | 'saved' | 'error'
-
-const cellKey = (period: Period, field: Field) => `${period}:${field}`
-
-function toInputValue(value: number | null | undefined, field: Field): string {
-  if (value == null) return ''
-  return field === 'qty' ? String(Math.round(value)) : value.toFixed(2)
-}
-
-/** Per-part drafts: the cells edited since the last successful save. */
 type Drafts = Record<number, Record<string, string>>
 
+type Preview = {
+  askingPrice: number | null
+  askingShipping: number | null
+  activeQty: number | null
+  sampleSize: number
+  broadMatchCount: number | null
+  mpnRejectedCount: number
+  conditionRejectedCount: number
+  truncated: boolean
+}
+
+const periodKey = (period: Period, field: 'price' | 'shipping' | 'soldQty' | 'priceBasis') =>
+  `period:${period}:${field}`
+const activeKey = (field: 'askingPrice' | 'askingShipping' | 'activeQty') => `active:${field}`
+
+function inputNumber(value: number | null | undefined, integer = false): string {
+  if (value == null) return ''
+  return integer ? String(Math.round(value)) : value.toFixed(2)
+}
+
 export function MarketGrid({ rows }: { rows: GridRow[] }) {
+  const router = useRouter()
   const [search, setSearch] = useState('')
   const [open, setOpen] = useState<number | null>(null)
-
-  /*
-   * Edits live here while you type, so a server round-trip can never yank a
-   * value out from under the cursor. A part's drafts clear only when its save
-   * succeeds, which is what hands the cell back to the stored value.
-   */
   const [drafts, setDrafts] = useState<Drafts>({})
   const [states, setStates] = useState<Record<number, PartState>>({})
   const [errors, setErrors] = useState<Record<number, string>>({})
+  const [previews, setPreviews] = useState<Record<number, Preview>>({})
+  const [previewing, setPreviewing] = useState<Record<number, boolean>>({})
+  const [activeOrigins, setActiveOrigins] = useState<Record<number, 'manual' | 'ebay_browse'>>({})
+  const draftsRef = useRef(drafts)
 
-  const timers = useRef<Record<number, ReturnType<typeof setTimeout>>>({})
-
-  /*
-   * A mirror of `drafts` that the debounced callback can read. The callback
-   * fires long after the render that scheduled it, so closing over `drafts`
-   * directly would send whatever had been typed at schedule time and silently
-   * drop every keystroke after it. Synced in an effect rather than during
-   * render, which commits before any of the flush paths can run.
-   */
-  const draftsRef = useRef<Drafts>(drafts)
   useEffect(() => {
     draftsRef.current = drafts
   }, [drafts])
 
   const pendingCount = useMemo(
-    () => Object.values(drafts).filter((part) => Object.keys(part).length > 0).length,
+    () => Object.values(drafts).filter((draft) => Object.keys(draft).length > 0).length,
     [drafts],
   )
 
-  useEffect(() => {
-    const pending = timers.current
-    return () => {
-      for (const timer of Object.values(pending)) clearTimeout(timer)
-    }
-  }, [])
-
-  // A save is at most a second away, but a tab closed inside that second would
-  // lose it silently. Worth one confirm dialog.
   useEffect(() => {
     if (pendingCount === 0) return
     const warn = (event: BeforeUnloadEvent) => event.preventDefault()
     window.addEventListener('beforeunload', warn)
     return () => window.removeEventListener('beforeunload', warn)
   }, [pendingCount])
-
-  const commit = useCallback(async (partId: number) => {
-    const partDrafts = draftsRef.current[partId]
-    if (!partDrafts || Object.keys(partDrafts).length === 0) return
-
-    // Group the edited cells into one payload per touched window. Untouched
-    // fields are deliberately absent so the server carries forward whatever is
-    // current rather than taking a stale copy from this browser.
-    const byPeriod = new Map<Period, WindowInput>()
-    for (const [key, value] of Object.entries(partDrafts)) {
-      const [period, field] = key.split(':') as [Period, Field]
-      const window = byPeriod.get(period) ?? { period }
-      window[field] = value
-      byPeriod.set(period, window)
-    }
-
-    const sent = { ...partDrafts }
-    setStates((prev) => ({ ...prev, [partId]: 'saving' }))
-
-    const result = await saveMarketWindows({ partId, windows: [...byPeriod.values()] })
-
-    if (result.ok) {
-      setStates((prev) => ({ ...prev, [partId]: 'saved' }))
-      setErrors((prev) => {
-        const next = { ...prev }
-        delete next[partId]
-        return next
-      })
-      // Drop only what was sent — anything typed during the round-trip stays
-      // pending and gets picked up by its own save.
-      setDrafts((prev) => {
-        const remaining = { ...(prev[partId] ?? {}) }
-        for (const key of Object.keys(sent)) {
-          if (remaining[key] === sent[key]) delete remaining[key]
-        }
-        return { ...prev, [partId]: remaining }
-      })
-      setTimeout(() => {
-        setStates((prev) => (prev[partId] === 'saved' ? { ...prev, [partId]: 'idle' } : prev))
-      }, 1800)
-    } else {
-      setStates((prev) => ({ ...prev, [partId]: 'error' }))
-      setErrors((prev) => ({ ...prev, [partId]: result.error }))
-    }
-  }, [])
-
-  const schedule = useCallback(
-    (partId: number) => {
-      const existing = timers.current[partId]
-      if (existing) clearTimeout(existing)
-      timers.current[partId] = setTimeout(() => {
-        delete timers.current[partId]
-        void commit(partId)
-      }, DEBOUNCE_MS)
-    },
-    [commit],
-  )
-
-  const onChange = useCallback(
-    (partId: number, period: Period, field: Field, value: string) => {
-      setDrafts((prev) => ({
-        ...prev,
-        [partId]: { ...(prev[partId] ?? {}), [cellKey(period, field)]: value },
-      }))
-      schedule(partId)
-    },
-    [schedule],
-  )
-
-  /** Saves the part now rather than waiting out the debounce. */
-  const flush = useCallback(
-    (partId: number) => {
-      const existing = timers.current[partId]
-      if (!existing) return
-      clearTimeout(existing)
-      delete timers.current[partId]
-      void commit(partId)
-    },
-    [commit],
-  )
 
   const visible = useMemo(() => {
     const query = search.trim().toLowerCase()
@@ -183,32 +97,145 @@ export function MarketGrid({ rows }: { rows: GridRow[] }) {
     )
   }, [rows, search])
 
+  const setDraft = useCallback((partId: number, key: string, value: string) => {
+    setDrafts((previous) => ({
+      ...previous,
+      [partId]: { ...(previous[partId] ?? {}), [key]: value },
+    }))
+    setStates((previous) => ({ ...previous, [partId]: 'idle' }))
+  }, [])
+
+  const displayedPeriod = (row: GridRow, period: Period, field: 'price' | 'shipping' | 'soldQty') => {
+    const draft = drafts[row.partId]?.[periodKey(period, field)]
+    if (draft !== undefined) return draft
+    const value = row.periods[period]?.[field]
+    return inputNumber(value, field === 'soldQty')
+  }
+
+  const displayedBasis = (row: GridRow, period: Period): PriceBasis => {
+    const draft = drafts[row.partId]?.[periodKey(period, 'priceBasis')]
+    return (draft as PriceBasis | undefined) ?? row.periods[period]?.priceBasis ?? 'unknown'
+  }
+
+  const displayedActive = (row: GridRow, field: 'askingPrice' | 'askingShipping' | 'activeQty') => {
+    const draft = drafts[row.partId]?.[activeKey(field)]
+    if (draft !== undefined) return draft
+    const value = row.activeMarket?.[field]
+    return inputNumber(value, field === 'activeQty')
+  }
+
+  const commit = useCallback(async (row: GridRow) => {
+    const draft = draftsRef.current[row.partId]
+    if (!draft || Object.keys(draft).length === 0) return
+
+    const windows = new Map<Period, WindowInput>()
+    const active: ActiveInput = {}
+    let hasActive = false
+
+    for (const [key, value] of Object.entries(draft)) {
+      const pieces = key.split(':')
+      if (pieces[0] === 'period') {
+        const period = pieces[1] as Period
+        const field = pieces[2] as 'price' | 'shipping' | 'soldQty' | 'priceBasis'
+        const window = windows.get(period) ?? { period }
+        window[field] = value
+        windows.set(period, window)
+      } else if (pieces[0] === 'active') {
+        const field = pieces[1] as keyof ActiveInput
+        active[field] = value
+        hasActive = true
+      }
+    }
+
+    if (hasActive) {
+      const origin = activeOrigins[row.partId] ?? 'manual'
+      active.source = origin
+      if (origin === 'ebay_browse') {
+        const preview = previews[row.partId]
+        if (preview) {
+          active.sampleSize = preview.sampleSize
+          active.broadMatchCount = preview.broadMatchCount
+          active.mpnRejectedCount = preview.mpnRejectedCount
+          active.conditionRejectedCount = preview.conditionRejectedCount
+          active.truncated = preview.truncated
+        }
+      }
+    }
+
+    const sent = { ...draft }
+    setStates((previous) => ({ ...previous, [row.partId]: 'saving' }))
+    const result = await saveMarketPart({
+      partId: row.partId,
+      windows: [...windows.values()],
+      ...(hasActive ? { active } : {}),
+    })
+
+    if (!result.ok) {
+      setStates((previous) => ({ ...previous, [row.partId]: 'error' }))
+      setErrors((previous) => ({ ...previous, [row.partId]: result.error }))
+      return
+    }
+
+    setDrafts((previous) => {
+      const remaining = { ...(previous[row.partId] ?? {}) }
+      for (const [key, value] of Object.entries(sent)) {
+        if (remaining[key] === value) delete remaining[key]
+      }
+      return { ...previous, [row.partId]: remaining }
+    })
+    setErrors((previous) => {
+      const next = { ...previous }
+      delete next[row.partId]
+      return next
+    })
+    setStates((previous) => ({ ...previous, [row.partId]: 'saved' }))
+    router.refresh()
+    setTimeout(() => {
+      setStates((previous) =>
+        previous[row.partId] === 'saved' ? { ...previous, [row.partId]: 'idle' } : previous,
+      )
+    }, 1800)
+  }, [activeOrigins, previews, router])
+
+  const previewActive = useCallback(async (row: GridRow) => {
+    setPreviewing((previous) => ({ ...previous, [row.partId]: true }))
+    setErrors((previous) => {
+      const next = { ...previous }
+      delete next[row.partId]
+      return next
+    })
+    try {
+      const response = await fetch(`/api/ebay/preview/${encodeURIComponent(row.mpn)}`, {
+        cache: 'no-store',
+      })
+      const body = (await response.json()) as Preview & { error?: string }
+      if (!response.ok) throw new Error(body.error ?? 'Could not preview eBay.')
+      setPreviews((previous) => ({ ...previous, [row.partId]: body }))
+      if (body.askingPrice != null) setDraft(row.partId, activeKey('askingPrice'), body.askingPrice.toFixed(2))
+      if (body.askingShipping != null) setDraft(row.partId, activeKey('askingShipping'), body.askingShipping.toFixed(2))
+      if (body.activeQty != null) setDraft(row.partId, activeKey('activeQty'), String(body.activeQty))
+      setActiveOrigins((previous) => ({ ...previous, [row.partId]: 'ebay_browse' }))
+    } catch (error) {
+      setErrors((previous) => ({
+        ...previous,
+        [row.partId]: error instanceof Error ? error.message : 'Could not preview eBay.',
+      }))
+    } finally {
+      setPreviewing((previous) => ({ ...previous, [row.partId]: false }))
+    }
+  }, [setDraft])
+
   if (rows.length === 0) {
     return (
       <EmptyState
         title="No parts to track"
-        body="Seed the catalogue with pnpm db:seed, or add parts from the Inventory page."
+        body="Seed the catalogue with pnpm db:seed, or add parts from Inventory."
         cta={{ href: '/inventory', label: 'Go to Inventory' }}
       />
     )
   }
 
   const columns = `minmax(140px, 180px) minmax(0, 1fr) 52px repeat(5, minmax(86px, 104px))`
-
-  /** The value a cell shows: the draft while editing, otherwise what is stored. */
-  const displayed = (row: GridRow, period: Period, field: Field): string => {
-    const draft = drafts[row.partId]?.[cellKey(period, field)]
-    return draft ?? toInputValue(row.periods[period]?.[field], field)
-  }
-
-  /** Row total, computed from drafts so the summary tracks what you type. */
-  const displayedTotal = (row: GridRow, period: Period): number | null => {
-    const price = Number(displayed(row, period, 'price'))
-    if (!Number.isFinite(price) || displayed(row, period, 'price') === '') return null
-    const shippingRaw = displayed(row, period, 'shipping')
-    const shipping = shippingRaw === '' ? 0 : Number(shippingRaw)
-    return price + (Number.isFinite(shipping) ? shipping : 0)
-  }
 
   return (
     <div>
@@ -221,11 +248,11 @@ export function MarketGrid({ rows }: { rows: GridRow[] }) {
           className="field max-w-sm flex-1 px-3 py-1.5 font-mono text-sm outline-none focus:border-[var(--color-good)]"
         />
         <span className="text-ink-faint text-xs">
-          {visible.length} parts — click a row to enter comps. Saves as you type.
+          {visible.length} parts · no autosave · Neon writes only when you press Save MPN
         </span>
         {pendingCount > 0 && (
           <span className="text-warn font-mono text-xs" role="status">
-            ● {pendingCount} saving…
+            ● {pendingCount} MPN{pendingCount === 1 ? '' : 's'} with unsaved edits
           </span>
         )}
       </div>
@@ -240,22 +267,19 @@ export function MarketGrid({ rows }: { rows: GridRow[] }) {
             <div>Description</div>
             <div className="text-center">Qty</div>
             {PERIODS.map((period) => (
-              <div key={period} className="text-center">
-                {PERIOD_LABELS[period]}
-              </div>
+              <div key={period} className="text-center">{PERIOD_LABELS[period]}</div>
             ))}
           </div>
 
           {visible.map((row, index) => {
             const isOpen = open === row.partId
+            const draft = drafts[row.partId] ?? {}
+            const unsaved = Object.keys(draft).length > 0
             const state = states[row.partId] ?? 'idle'
-            const unsaved = Object.keys(drafts[row.partId] ?? {}).length > 0
+            const preview = previews[row.partId]
 
             return (
-              <div
-                key={row.partId}
-                className={index < visible.length - 1 ? 'border-line border-b' : ''}
-              >
+              <div key={row.partId} className={index < visible.length - 1 ? 'border-line border-b' : ''}>
                 <button
                   type="button"
                   onClick={() => setOpen(isOpen ? null : row.partId)}
@@ -267,171 +291,149 @@ export function MarketGrid({ rows }: { rows: GridRow[] }) {
                 >
                   <span className="text-info flex items-center gap-1.5 font-mono text-xs">
                     {row.mpn}
-                    {unsaved && (
-                      <span className="text-warn" title="Unsaved edits">
-                        ●
-                      </span>
-                    )}
-                    {state === 'error' && (
-                      <span className="text-bad" title="Save failed">
-                        !
-                      </span>
-                    )}
+                    {unsaved && <span className="text-warn" title="Unsaved edits">●</span>}
+                    {state === 'saved' && <span className="text-good" title="Saved">✓</span>}
+                    {state === 'error' && <span className="text-bad" title="Save failed">!</span>}
                   </span>
                   <span className="text-ink truncate pr-4 text-sm">{row.description}</span>
-                  <span className="text-ink-dim text-center font-mono text-sm">
-                    {row.inventoryQty}
-                  </span>
+                  <span className="text-ink-dim text-center font-mono text-xs">{row.inventoryQty}</span>
                   {PERIODS.map((period) => {
-                    const total = displayedTotal(row, period)
+                    const priceRaw = displayedPeriod(row, period, 'price')
+                    const shippingRaw = displayedPeriod(row, period, 'shipping')
+                    const price = priceRaw === '' ? null : Number(priceRaw)
+                    const shipping = shippingRaw === '' ? 0 : Number(shippingRaw)
+                    const total = price != null && Number.isFinite(price) ? price + (Number.isFinite(shipping) ? shipping : 0) : null
                     return (
-                      <span
-                        key={period}
-                        className={`text-center font-mono text-xs ${
-                          total == null ? 'text-ink-ghost' : 'text-ink'
-                        }`}
-                      >
-                        {total == null ? '—' : money(total)}
+                      <span key={period} className="text-ink-dim text-center font-mono text-xs">
+                        {money(total)}
                       </span>
                     )
                   })}
                 </button>
 
                 {isOpen && (
-                  <div
-                    className="border-line bg-good/[0.03] border-t px-4 pt-3 pb-4"
-                    /*
-                     * React's onBlur is focusout, so it bubbles. Tabbing from one
-                     * cell to the next within this part keeps the batch open;
-                     * only focus actually leaving the part flushes it. Putting
-                     * this on each input instead sent one request per cell.
-                     */
-                    onBlur={(event) => {
-                      if (event.currentTarget.contains(event.relatedTarget)) return
-                      flush(row.partId)
-                    }}
-                  >
-                    <div className="mb-3 flex flex-wrap items-center gap-3">
-                      <span className="text-ink-faint text-xs tracking-widest uppercase">
-                        Market data — {row.description}
-                      </span>
-
-                      <span
-                        role="status"
-                        className={`font-mono text-xs ${
-                          state === 'error'
-                            ? 'text-bad'
-                            : state === 'saved'
-                              ? 'text-good'
-                              : 'text-ink-faint'
-                        }`}
-                      >
-                        {state === 'saving'
-                          ? 'Saving…'
-                          : state === 'saved'
-                            ? 'Saved'
-                            : state === 'error'
-                              ? (errors[row.partId] ?? 'Save failed')
-                              : unsaved
-                                ? 'Unsaved'
-                                : ''}
-                      </span>
-
-                      <Link
-                        href={`/inventory/${encodeURIComponent(row.mpn)}`}
-                        className="text-info hover:text-good ml-auto font-mono text-xs transition-colors"
-                      >
-                        Charts &amp; history ↗
-                      </Link>
+                  <div className="border-line bg-surface/40 border-t px-4 py-4">
+                    <div className="grid gap-3 xl:grid-cols-5">
+                      {PERIODS.map((period) => {
+                        const observation = row.periods[period]
+                        return (
+                          <section key={period} className="border-line rounded border p-3">
+                            <div className="mb-2 flex items-center justify-between gap-2">
+                              <h3 className="text-ink-dim font-mono text-xs tracking-widest uppercase">{PERIOD_LABELS[period]}</h3>
+                              {observation && <SourceBadge source={observation.source} />}
+                            </div>
+                            <label className="text-ink-faint block text-[10px] tracking-widest uppercase">Price</label>
+                            <input
+                              inputMode="decimal"
+                              value={displayedPeriod(row, period, 'price')}
+                              onChange={(event) => setDraft(row.partId, periodKey(period, 'price'), event.target.value)}
+                              className="field mb-2 w-full px-2 py-1.5 font-mono text-xs"
+                            />
+                            <label className="text-ink-faint block text-[10px] tracking-widest uppercase">Buyer shipping</label>
+                            <input
+                              inputMode="decimal"
+                              value={displayedPeriod(row, period, 'shipping')}
+                              onChange={(event) => setDraft(row.partId, periodKey(period, 'shipping'), event.target.value)}
+                              className="field mb-2 w-full px-2 py-1.5 font-mono text-xs"
+                            />
+                            <label className="text-ink-faint block text-[10px] tracking-widest uppercase">Sold qty</label>
+                            <input
+                              inputMode="numeric"
+                              value={displayedPeriod(row, period, 'soldQty')}
+                              onChange={(event) => setDraft(row.partId, periodKey(period, 'soldQty'), event.target.value)}
+                              className="field mb-2 w-full px-2 py-1.5 font-mono text-xs"
+                            />
+                            <label className="text-ink-faint block text-[10px] tracking-widest uppercase">Price basis</label>
+                            <select
+                              value={displayedBasis(row, period)}
+                              onChange={(event) => setDraft(row.partId, periodKey(period, 'priceBasis'), event.target.value)}
+                              className="field w-full px-2 py-1.5 font-mono text-xs"
+                            >
+                              {(Object.keys(PRICE_BASIS_LABELS) as PriceBasis[]).map((basis) => (
+                                <option key={basis} value={basis}>{PRICE_BASIS_LABELS[basis]}</option>
+                              ))}
+                            </select>
+                            {observation && (
+                              <p className="text-ink-ghost mt-2 font-mono text-[10px]">
+                                {relativeTime(observation.capturedAt)}
+                                {observation.sampleSize != null ? ` · n=${observation.sampleSize}` : ''}
+                              </p>
+                            )}
+                          </section>
+                        )
+                      })}
                     </div>
 
-                    <div className="overflow-x-auto">
-                      <table className="border-collapse text-sm" style={{ minWidth: 640 }}>
-                        <thead>
-                          <tr className="border-line border-b">
-                            <th className="text-ink-faint w-28 pr-6 pb-2 text-left text-xs tracking-widest uppercase">
-                              Period
-                            </th>
-                            <th className="text-ink-faint w-28 px-3 pb-2 text-right text-xs tracking-widest uppercase">
-                              Price
-                            </th>
-                            <th className="text-ink-faint w-28 px-3 pb-2 text-right text-xs tracking-widest uppercase">
-                              Shipping
-                            </th>
-                            <th className="text-ink-faint w-20 px-3 pb-2 text-right text-xs tracking-widest uppercase">
-                              Qty
-                            </th>
-                            <th className="text-ink-faint w-24 px-3 pb-2 text-right text-xs tracking-widest uppercase">
-                              Total
-                            </th>
-                            <th className="text-ink-faint px-3 pb-2 text-left text-xs tracking-widest uppercase">
-                              Source
-                            </th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {PERIODS.map((period) => {
-                            const observation = row.periods[period]
-                            const total = displayedTotal(row, period)
+                    <section className="border-line mt-4 rounded border p-3">
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div>
+                          <h3 className="text-ink text-sm font-medium">Active eBay competition — point in time</h3>
+                          <p className="text-ink-faint mt-0.5 text-xs">Separate from sold lookback windows. Repeated captures build the supply trend.</p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => void previewActive(row)}
+                          disabled={previewing[row.partId]}
+                          className="border-line bg-surface text-info hover:border-info/40 rounded border px-3 py-1.5 font-mono text-xs disabled:opacity-50"
+                        >
+                          {previewing[row.partId] ? 'Checking eBay…' : 'Preview eBay Active'}
+                        </button>
+                      </div>
 
-                            return (
-                              <tr key={period} className="border-line/50 border-b">
-                                <td className="text-ink-dim py-2 pr-6 font-mono text-xs tracking-widest uppercase">
-                                  {PERIOD_LABELS[period]}
-                                </td>
+                      <div className="mt-3 grid gap-3 sm:grid-cols-3">
+                        {([
+                          ['askingPrice', 'Median asking price'],
+                          ['askingShipping', 'Median buyer shipping'],
+                          ['activeQty', 'Active listing qty'],
+                        ] as const).map(([field, label]) => (
+                          <label key={field} className="text-ink-faint text-[10px] tracking-widest uppercase">
+                            {label}
+                            <input
+                              inputMode={field === 'activeQty' ? 'numeric' : 'decimal'}
+                              value={displayedActive(row, field)}
+                              onChange={(event) => {
+                                setDraft(row.partId, activeKey(field), event.target.value)
+                                setActiveOrigins((previous) => ({ ...previous, [row.partId]: 'manual' }))
+                              }}
+                              className="field mt-1 w-full px-2 py-1.5 font-mono text-xs normal-case tracking-normal"
+                            />
+                          </label>
+                        ))}
+                      </div>
 
-                                {FIELDS.map((field) => (
-                                  <td key={field} className="px-3 py-1.5">
-                                    <input
-                                      type="number"
-                                      min={0}
-                                      step={field === 'qty' ? 1 : 0.01}
-                                      inputMode="decimal"
-                                      value={displayed(row, period, field)}
-                                      placeholder="—"
-                                      aria-label={`${row.mpn} ${PERIOD_LABELS[period]} ${field}`}
-                                      aria-invalid={state === 'error'}
-                                      onChange={(event) =>
-                                        onChange(row.partId, period, field, event.target.value)
-                                      }
-                                      onKeyDown={(event) => {
-                                        if (event.key === 'Enter') {
-                                          event.preventDefault()
-                                          flush(row.partId)
-                                        }
-                                      }}
-                                      className={`field w-full px-2 py-1 text-right font-mono text-xs outline-none focus:border-[var(--color-good)] ${
-                                        state === 'error' ? 'border-[var(--color-bad)]' : ''
-                                      }`}
-                                    />
-                                  </td>
-                                ))}
+                      {row.activeMarket && (
+                        <p className="text-ink-ghost mt-2 font-mono text-[10px]">
+                          Stored {relativeTime(row.activeMarket.capturedAt)} · {row.activeMarket.source === 'ebay_browse' ? 'eBay Browse' : 'manual'}
+                          {row.activeMarket.truncated ? ' · count withheld because results were truncated' : ''}
+                        </p>
+                      )}
+                      {preview && (
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          <Chip tone="info">Preview sample n={preview.sampleSize}</Chip>
+                          <Chip tone="dim">Rejected wrong MPN: {preview.mpnRejectedCount}</Chip>
+                          <Chip tone="dim">Rejected condition: {preview.conditionRejectedCount}</Chip>
+                          {preview.truncated && <Chip tone="warn">Broad result truncated — Active Qty not applied</Chip>}
+                        </div>
+                      )}
+                    </section>
 
-                                <td
-                                  className={`px-3 py-2 text-right font-mono text-xs ${
-                                    total == null ? 'text-ink-ghost' : 'text-good'
-                                  }`}
-                                >
-                                  {total == null ? '—' : money(total)}
-                                </td>
+                    {errors[row.partId] && (
+                      <p className="text-bad mt-3 text-xs" role="alert">{errors[row.partId]}</p>
+                    )}
 
-                                <td className="px-3 py-2">
-                                  {observation ? (
-                                    <span className="flex items-center gap-1.5">
-                                      <SourceBadge source={observation.source} />
-                                      <span className="text-ink-faint font-mono text-[10px]">
-                                        {relativeTime(observation.capturedAt)}
-                                      </span>
-                                    </span>
-                                  ) : (
-                                    <span className="text-ink-ghost font-mono text-xs">—</span>
-                                  )}
-                                </td>
-                              </tr>
-                            )
-                          })}
-                        </tbody>
-                      </table>
+                    <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
+                      <div className="text-ink-faint text-xs">
+                        {unsaved ? 'Edits are local until saved.' : 'No unsaved edits.'}{' '}
+                        <Link href={`/inventory/${encodeURIComponent(row.mpn)}`} className="text-info hover:text-good">Open detail →</Link>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => void commit(row)}
+                        disabled={!unsaved || state === 'saving'}
+                        className="bg-good text-black rounded px-4 py-2 font-mono text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        {state === 'saving' ? 'Saving…' : 'Save MPN'}
+                      </button>
                     </div>
                   </div>
                 )}
@@ -440,6 +442,10 @@ export function MarketGrid({ rows }: { rows: GridRow[] }) {
           })}
         </div>
       </div>
+
+      {visible.length === 0 && (
+        <p className="text-ink-faint py-6 text-center text-sm">Nothing matches that filter.</p>
+      )}
     </div>
   )
 }

@@ -48,6 +48,7 @@ export default async function SettingsPage() {
   }
 
   const cronConfigured = Boolean(process.env.CRON_SECRET)
+  const cronEnabled = process.env.EBAY_CRON_ENABLED === 'true'
 
   return (
     <div className="space-y-6">
@@ -73,8 +74,8 @@ export default async function SettingsPage() {
               <Chip>limit: {ebayDetail.limit}/run</Chip>
             </>
           )}
-          <Chip tone={cronConfigured ? 'good' : 'warn'}>
-            {cronConfigured ? 'Cron secret set' : 'No cron secret'}
+          <Chip tone={cronEnabled && cronConfigured ? 'good' : cronEnabled ? 'warn' : 'dim'}>
+            {cronEnabled ? (cronConfigured ? 'Daily sync enabled' : 'Daily sync missing secret') : 'Daily sync off'}
           </Chip>
         </div>
 
@@ -95,8 +96,7 @@ export default async function SettingsPage() {
             data comes from eBay&apos;s Marketplace Insights API, which is a restricted scope your
             app has to be approved for, and which reaches back 90 days. Without that approval the
             sync falls back to the Browse API, which only sees active listings — asking prices, not
-            comps. Every stored reading records which one it came from, and the board flags any part
-            whose read rests on asking prices alone.
+            comps. Sold observations and active asking-price snapshots are stored in separate streams, so sold demand can never be mistaken for competing supply. Every stored reading records its provenance.
           </p>
           <p>
             <strong className="text-ink font-medium">The 6-month and 1-year windows.</strong> No
@@ -114,7 +114,7 @@ export default async function SettingsPage() {
             <table className="w-full border-collapse text-sm" style={{ minWidth: 620 }}>
               <thead>
                 <tr className="border-line border-b">
-                  {['When', 'Trigger', 'Adapter', 'Parts', 'Snapshots', 'Status'].map((header) => (
+                  {['When', 'Trigger', 'Adapter', 'Parts', 'Sold / active', 'Status'].map((header) => (
                     <th
                       key={header}
                       scope="col"
@@ -142,7 +142,7 @@ export default async function SettingsPage() {
                       )}
                     </td>
                     <td className="text-ink py-2 pr-3 font-mono text-xs">
-                      {run.snapshotsWritten}
+                      {run.soldSnapshotsWritten} / {run.activeSnapshotsWritten}
                     </td>
                     <td className="py-2">
                       <Chip

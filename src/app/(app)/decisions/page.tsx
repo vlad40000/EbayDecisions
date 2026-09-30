@@ -1,7 +1,7 @@
 import { DecisionBoard, type BoardRow } from '@/components/decision-board'
 import { SyncButton } from '@/components/sync-button'
 import { DatabaseError, Notice, PageHeader, StatCard } from '@/components/ui'
-import { getSettings, listPartsWithMarket, recentSyncRuns } from '@/db/queries'
+import { getSettings, listPartsWithMarket, loadTrendSummaries, recentSyncRuns } from '@/db/queries'
 import { decide, type Action } from '@/lib/decisions'
 import { isEbayConfigured } from '@/lib/ebay/client'
 import { money, relativeTime } from '@/lib/format'
@@ -39,6 +39,7 @@ async function load(): Promise<Loaded> {
       listPartsWithMarket(),
       recentSyncRuns(1),
     ])
+    const trendSummaries = await loadTrendSummaries(parts.map((part) => part.id))
 
     const actionCounts = new Map<Action, number>()
     let units = 0
@@ -47,7 +48,7 @@ async function load(): Promise<Loaded> {
     let needsData = 0
 
     const rows: BoardRow[] = parts.map((part) => {
-      const decision = decide(part, settings)
+      const decision = decide(part, settings, trendSummaries.get(part.id))
       actionCounts.set(decision.action, (actionCounts.get(decision.action) ?? 0) + 1)
       units += part.inventoryQty
 
@@ -71,13 +72,17 @@ async function load(): Promise<Loaded> {
         marginPct: decision.economics?.marginPct ?? null,
         potentialDollars: potential,
         suggestedListPrice: decision.suggestedListPrice,
-        costTrendDirection: decision.costTrend.direction,
-        costTrendPct: decision.costTrend.pctPerPeriod,
+        marketTrendDirection: decision.marketTrend.direction,
+        marketTrendPct: decision.marketTrend.pctPer30d,
+        marketTrendBasis: decision.marketTrend.basis,
+        demandTrendDirection: decision.demandTrend.direction,
+        demandTrendPct: decision.demandTrend.pctPer30d,
+        supplyTrendDirection: decision.supplyTrend.direction,
+        supplyTrendPct: decision.supplyTrend.pctPer30d,
         action: decision.action,
         reason: decision.reason,
         notes: decision.notes,
-        askingPricesOnly: decision.askingPricesOnly,
-        thinData: decision.thinData,
+        provenance: decision.provenance,
       }
     })
 

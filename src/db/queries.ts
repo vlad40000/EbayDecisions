@@ -1,40 +1,37 @@
 import 'server-only'
 
-import { and, desc, eq, inArray, sql } from 'drizzle-orm'
+import { and, desc, eq, gte, inArray, sql } from 'drizzle-orm'
 
 import { categoryOf } from '@/lib/categories'
 import { toDbNumeric, toNumber } from '@/lib/format'
-import type {
-  EconomicSettings,
-  Part,
-  PartWithMarket,
-  Period,
-  PeriodObservation,
-  SnapshotSource,
+import { timeTrend } from '@/lib/stats'
+import {
+  PERIOD_DAYS,
+  type ActiveMarketObservation,
+  type EconomicSettings,
+  type Part,
+  type PartWithMarket,
+  type Period,
+  type PeriodObservation,
+  type PriceBasis,
+  type SnapshotSource,
+  type TrendSummary,
 } from '@/lib/types'
 
 import { db } from './index'
 import {
+  activeMarketSnapshots,
   ebaySyncRuns,
   marketSnapshots,
   parts,
   settings,
-  type NewSnapshotRow,
-  type PartRow,
+  type ActiveSnapshotRow,
   type SnapshotRow,
 } from './schema'
 
-/**
- * A manual edit within this window updates the row it is editing instead of
- * appending a new one, so typing into three fields of one window produces one
- * snapshot rather than three near-identical ones. Longer gaps append, which is
- * what preserves the history the trend math reads.
- */
-const MANUAL_COALESCE_MINUTES = 10
-
 // ─── Mapping ──────────────────────────────────────────────────────────────────
 
-function mapPart(row: PartRow): Part {
+function mapPart(row: typeof parts.$inferSelect): Part {
   return {
     id: row.id,
     mpn: row.mpn,
@@ -54,17 +51,45 @@ function mapPart(row: PartRow): Part {
 function mapObservation(row: {
   price: string | null
   shipping: string | null
-  qty: number | null
+  soldQty: number | null
   source: SnapshotSource
+  priceBasis: PriceBasis
   sampleSize: number | null
   capturedAt: Date
 }): PeriodObservation {
   return {
     price: toNumber(row.price),
     shipping: toNumber(row.shipping),
-    qty: row.qty,
+    soldQty: row.soldQty,
     source: row.source,
+    priceBasis: row.priceBasis,
     sampleSize: row.sampleSize,
+    capturedAt: row.capturedAt.toISOString(),
+  }
+}
+
+function mapActiveObservation(row: {
+  askingPrice: string | null
+  askingShipping: string | null
+  activeQty: number | null
+  source: SnapshotSource
+  sampleSize: number | null
+  broadMatchCount: number | null
+  mpnRejectedCount: number | null
+  conditionRejectedCount: number | null
+  truncated: boolean
+  capturedAt: Date
+}): ActiveMarketObservation {
+  return {
+    askingPrice: toNumber(row.askingPrice),
+    askingShipping: toNumber(row.askingShipping),
+    activeQty: row.activeQty,
+    source: row.source === 'ebay_browse' ? 'ebay_browse' : 'manual',
+    sampleSize: row.sampleSize,
+    broadMatchCount: row.broadMatchCount,
+    mpnRejectedCount: row.mpnRejectedCount,
+    conditionRejectedCount: row.conditionRejectedCount,
+    truncated: row.truncated,
     capturedAt: row.capturedAt.toISOString(),
   }
 }
@@ -79,11 +104,9 @@ const SETTINGS_DEFAULTS: EconomicSettings = {
   minMarginPct: 15,
 }
 
-/** Reads the single settings row, creating it with defaults on first call. */
 export async function getSettings(): Promise<EconomicSettings> {
   const rows = await db.select().from(settings).where(eq(settings.id, 1)).limit(1)
   const row = rows[0]
-
   if (!row) {
     await db.insert(settings).values({ id: 1 }).onConflictDoNothing()
     return SETTINGS_DEFAULTS
@@ -131,8 +154,7 @@ export async function listParts(options: { includeInactive?: boolean } = {}): Pr
 
 export async function getPartByMpn(mpn: string): Promise<Part | null> {
   const rows = await db.select().from(parts).where(eq(parts.mpn, mpn)).limit(1)
-  const row = rows[0]
-  return row ? mapPart(row) : null
+  return rows[0] ? mapPart(rows[0]) : null
 }
 
 export type PartInput = {
@@ -164,10 +186,8 @@ export async function createPart(input: PartInput): Promise<Part> {
       active: input.active ?? true,
     })
     .returning()
-
-  const row = rows[0]
-  if (!row) throw new Error('Insert returned no row')
-  return mapPart(row)
+  if (!rows[0]) throw new Error('Insert returned no row')
+  return mapPart(rows[0])
 }
 
 export async function updatePart(id: number, input: Partial<PartInput>): Promise<void> {
@@ -195,31 +215,22 @@ export async function deletePart(id: number): Promise<void> {
   await db.delete(parts).where(eq(parts.id, id))
 }
 
-/** Upsert by MPN. Used by the seed script and the CSV importer. */
 export async function upsertPartByMpn(input: PartInput): Promise<'inserted' | 'updated'> {
   const existing = await db
     .select({ id: parts.id })
     .from(parts)
     .where(eq(parts.mpn, input.mpn.trim()))
     .limit(1)
-
-  const found = existing[0]
-  if (found) {
-    await updatePart(found.id, input)
+  if (existing[0]) {
+    await updatePart(existing[0].id, input)
     return 'updated'
   }
   await createPart(input)
   return 'inserted'
 }
 
-// ─── Snapshots ────────────────────────────────────────────────────────────────
+// ─── Current market reads ─────────────────────────────────────────────────────
 
-/**
- * Newest observation per (part, period) for the given parts.
- *
- * `DISTINCT ON` is the Postgres-native way to do a latest-per-group read in one
- * pass, and it uses the (part_id, period, captured_at DESC) index directly.
- */
 export async function latestSnapshots(
   partIds: number[],
 ): Promise<Map<number, Partial<Record<Period, PeriodObservation>>>> {
@@ -232,8 +243,9 @@ export async function latestSnapshots(
       period: marketSnapshots.period,
       price: marketSnapshots.price,
       shipping: marketSnapshots.shipping,
-      qty: marketSnapshots.qty,
+      soldQty: marketSnapshots.soldQty,
       source: marketSnapshots.source,
+      priceBasis: marketSnapshots.priceBasis,
       sampleSize: marketSnapshots.sampleSize,
       capturedAt: marketSnapshots.capturedAt,
     })
@@ -248,10 +260,37 @@ export async function latestSnapshots(
 
   for (const row of rows) {
     const existing = byPart.get(row.partId) ?? {}
-    existing[row.period] = mapObservation(row)
+    existing[row.period as Period] = mapObservation(row)
     byPart.set(row.partId, existing)
   }
+  return byPart
+}
 
+export async function latestActiveSnapshots(
+  partIds: number[],
+): Promise<Map<number, ActiveMarketObservation>> {
+  const byPart = new Map<number, ActiveMarketObservation>()
+  if (partIds.length === 0) return byPart
+
+  const rows = await db
+    .selectDistinctOn([activeMarketSnapshots.partId], {
+      partId: activeMarketSnapshots.partId,
+      askingPrice: activeMarketSnapshots.askingPrice,
+      askingShipping: activeMarketSnapshots.askingShipping,
+      activeQty: activeMarketSnapshots.activeQty,
+      source: activeMarketSnapshots.source,
+      sampleSize: activeMarketSnapshots.sampleSize,
+      broadMatchCount: activeMarketSnapshots.broadMatchCount,
+      mpnRejectedCount: activeMarketSnapshots.mpnRejectedCount,
+      conditionRejectedCount: activeMarketSnapshots.conditionRejectedCount,
+      truncated: activeMarketSnapshots.truncated,
+      capturedAt: activeMarketSnapshots.capturedAt,
+    })
+    .from(activeMarketSnapshots)
+    .where(inArray(activeMarketSnapshots.partId, partIds))
+    .orderBy(activeMarketSnapshots.partId, desc(activeMarketSnapshots.capturedAt), desc(activeMarketSnapshots.id))
+
+  for (const row of rows) byPart.set(row.partId, mapActiveObservation(row))
   return byPart
 }
 
@@ -259,154 +298,183 @@ export async function listPartsWithMarket(
   options: { includeInactive?: boolean } = {},
 ): Promise<PartWithMarket[]> {
   const rows = await listParts(options)
-  const snapshots = await latestSnapshots(rows.map((p) => p.id))
-  return rows.map((part) => ({ ...part, periods: snapshots.get(part.id) ?? {} }))
+  const ids = rows.map((part) => part.id)
+  const [snapshots, active] = await Promise.all([latestSnapshots(ids), latestActiveSnapshots(ids)])
+  return rows.map((part) => ({
+    ...part,
+    periods: snapshots.get(part.id) ?? {},
+    activeMarket: active.get(part.id) ?? null,
+  }))
 }
 
 export async function getPartWithMarket(mpn: string): Promise<PartWithMarket | null> {
   const part = await getPartByMpn(mpn)
   if (!part) return null
-  const snapshots = await latestSnapshots([part.id])
-  return { ...part, periods: snapshots.get(part.id) ?? {} }
+  const [snapshots, active] = await Promise.all([latestSnapshots([part.id]), latestActiveSnapshots([part.id])])
+  return {
+    ...part,
+    periods: snapshots.get(part.id) ?? {},
+    activeMarket: active.get(part.id) ?? null,
+  }
 }
 
-/** Full snapshot history for one part, newest first. Powers the history chart. */
 export async function snapshotHistory(partId: number, limit = 500): Promise<SnapshotRow[]> {
   return db
     .select()
     .from(marketSnapshots)
     .where(eq(marketSnapshots.partId, partId))
-    .orderBy(desc(marketSnapshots.capturedAt))
+    .orderBy(desc(marketSnapshots.capturedAt), desc(marketSnapshots.id))
     .limit(limit)
 }
 
-export type ManualSnapshotPatch = {
+export async function activeSnapshotHistory(partId: number, limit = 500): Promise<ActiveSnapshotRow[]> {
+  return db
+    .select()
+    .from(activeMarketSnapshots)
+    .where(eq(activeMarketSnapshots.partId, partId))
+    .orderBy(desc(activeMarketSnapshots.capturedAt), desc(activeMarketSnapshots.id))
+    .limit(limit)
+}
+
+// ─── Explicit manual save ─────────────────────────────────────────────────────
+
+export type ManualWindowPatch = {
+  period: Period
   price?: number | null
   shipping?: number | null
-  qty?: number | null
+  soldQty?: number | null
+  priceBasis?: PriceBasis
 }
 
-export type WindowPatch = ManualSnapshotPatch & { period: Period }
+export type ManualActivePatch = {
+  askingPrice?: number | null
+  askingShipping?: number | null
+  activeQty?: number | null
+  source?: 'manual' | 'ebay_browse'
+  sampleSize?: number | null
+  broadMatchCount?: number | null
+  mpnRejectedCount?: number | null
+  conditionRejectedCount?: number | null
+  truncated?: boolean
+}
 
 /**
- * Records manual edits to one or more of a part's windows.
+ * Persists one part's explicit Save action in one Postgres statement.
  *
- * Batched deliberately. Typing across a part's five windows used to be up to
- * fifteen separate round-trips; this is at most three regardless — one read,
- * one bulk update, one bulk insert — and usually two. Neon charges for the time
- * its compute is awake, and a chatty write path is the easiest way to keep it
- * awake for no reason.
- *
- * Two behaviours worth knowing:
- *
- * 1. A recent manual row for the same window is updated in place
- *    (MANUAL_COALESCE_MINUTES), so an editing session leaves one row per window
- *    rather than one per keystroke.
- * 2. When a new row is appended, untouched fields are carried forward from the
- *    live current values — otherwise typing a price would silently blank the
- *    shipping figure beside it. Only the fields a person actually edited are
- *    sent, so a sync that landed mid-edit is not overwritten with stale
- *    numbers. The new row is marked `manual` because a person set it.
+ * Only touched fields are supplied by the browser. The CTE reads the live latest
+ * rows and carries untouched fields forward, so a sync that landed after the
+ * screen loaded cannot be overwritten by stale browser state. Every save
+ * appends; same-day corrections remain auditable, while trend calculation later
+ * collapses a UTC day to its latest observation.
  */
-export async function saveManualSnapshots(
-  partId: number,
-  patches: WindowPatch[],
-): Promise<void> {
-  if (patches.length === 0) return
+export async function saveManualMarket(input: {
+  partId: number
+  windows: ManualWindowPatch[]
+  active?: ManualActivePatch
+}): Promise<number> {
+  const { partId, windows, active } = input
+  if (windows.length === 0 && !active) return 0
 
-  const periods = patches.map((patch) => patch.period)
+  const windowCtes =
+    windows.length > 0
+      ? sql`
+        window_input(period, has_price, price, has_shipping, shipping, has_sold_qty, sold_qty, has_basis, price_basis) AS (
+          VALUES ${sql.join(
+            windows.map((patch) => sql`(
+              ${patch.period}::period,
+              ${patch.price !== undefined}::boolean,
+              ${toDbNumeric(patch.price)}::numeric(10,2),
+              ${patch.shipping !== undefined}::boolean,
+              ${toDbNumeric(patch.shipping)}::numeric(10,2),
+              ${patch.soldQty !== undefined}::boolean,
+              ${patch.soldQty ?? null}::integer,
+              ${patch.priceBasis !== undefined}::boolean,
+              ${patch.priceBasis ?? null}::price_basis
+            )`),
+            sql`, `,
+          )}
+        ),
+        current_window AS (
+          SELECT DISTINCT ON (m.period)
+            m.period, m.price, m.shipping, m.sold_qty, m.price_basis
+          FROM ${marketSnapshots} m
+          JOIN window_input i ON i.period = m.period
+          WHERE m.part_id = ${partId}
+          ORDER BY m.period, m.captured_at DESC, m.id DESC
+        ),
+        inserted_windows AS (
+          INSERT INTO ${marketSnapshots}
+            (part_id, period, price, shipping, sold_qty, source, price_basis, sample_size, captured_at)
+          SELECT
+            ${partId}, i.period,
+            CASE WHEN i.has_price THEN i.price ELSE c.price END,
+            CASE WHEN i.has_shipping THEN i.shipping ELSE c.shipping END,
+            CASE WHEN i.has_sold_qty THEN i.sold_qty ELSE c.sold_qty END,
+            'manual'::snapshot_source,
+            CASE WHEN i.has_basis THEN i.price_basis ELSE COALESCE(c.price_basis, 'unknown'::price_basis) END,
+            NULL, now()
+          FROM window_input i
+          LEFT JOIN current_window c ON c.period = i.period
+          RETURNING 1
+        )`
+      : sql`inserted_windows AS (SELECT 1 WHERE false)`
 
-  // One read: the newest row per affected window, which is both the coalescing
-  // target and the source of any carried-forward field.
-  const currentRows = await db
-    .selectDistinctOn([marketSnapshots.period], {
-      id: marketSnapshots.id,
-      period: marketSnapshots.period,
-      price: marketSnapshots.price,
-      shipping: marketSnapshots.shipping,
-      qty: marketSnapshots.qty,
-      source: marketSnapshots.source,
-      capturedAt: marketSnapshots.capturedAt,
-    })
-    .from(marketSnapshots)
-    .where(
-      and(eq(marketSnapshots.partId, partId), inArray(marketSnapshots.period, periods)),
-    )
-    .orderBy(marketSnapshots.period, desc(marketSnapshots.capturedAt), desc(marketSnapshots.id))
+  const activeCtes = active
+    ? sql`
+      active_current AS (
+        SELECT asking_price, asking_shipping, active_qty
+        FROM ${activeMarketSnapshots}
+        WHERE part_id = ${partId}
+        ORDER BY captured_at DESC, id DESC
+        LIMIT 1
+      ),
+      inserted_active AS (
+        INSERT INTO ${activeMarketSnapshots}
+          (part_id, asking_price, asking_shipping, active_qty, source, sample_size,
+           broad_match_count, mpn_rejected_count, condition_rejected_count, truncated, captured_at)
+        SELECT
+          ${partId},
+          CASE WHEN ${active.askingPrice !== undefined}::boolean THEN ${toDbNumeric(active.askingPrice)}::numeric(10,2) ELSE c.asking_price END,
+          CASE WHEN ${active.askingShipping !== undefined}::boolean THEN ${toDbNumeric(active.askingShipping)}::numeric(10,2) ELSE c.asking_shipping END,
+          CASE WHEN ${active.activeQty !== undefined}::boolean THEN ${active.activeQty ?? null}::integer ELSE c.active_qty END,
+          ${(active.source ?? 'manual')}::snapshot_source,
+          ${active.source === 'ebay_browse' ? (active.sampleSize ?? null) : null}::integer,
+          ${active.source === 'ebay_browse' ? (active.broadMatchCount ?? null) : null}::integer,
+          ${active.source === 'ebay_browse' ? (active.mpnRejectedCount ?? null) : null}::integer,
+          ${active.source === 'ebay_browse' ? (active.conditionRejectedCount ?? null) : null}::integer,
+          ${active.source === 'ebay_browse' ? (active.truncated ?? false) : false}::boolean, now()
+        FROM (SELECT 1) seed
+        LEFT JOIN active_current c ON true
+        RETURNING 1
+      )`
+    : sql`inserted_active AS (SELECT 1 WHERE false)`
 
-  const current = new Map(currentRows.map((row) => [row.period, row]))
-  const cutoff = Date.now() - MANUAL_COALESCE_MINUTES * 60 * 1000
+  await db.execute(sql`
+    WITH ${windowCtes}, ${activeCtes}
+    SELECT
+      (SELECT count(*)::int FROM inserted_windows) +
+      (SELECT count(*)::int FROM inserted_active) AS written
+  `)
 
-  const updates: { id: number; price: string | null; shipping: string | null; qty: number | null }[] =
-    []
-  const inserts: NewSnapshotRow[] = []
-
-  for (const patch of patches) {
-    const existing = current.get(patch.period)
-
-    const merged = {
-      price: patch.price !== undefined ? toDbNumeric(patch.price) : (existing?.price ?? null),
-      shipping:
-        patch.shipping !== undefined ? toDbNumeric(patch.shipping) : (existing?.shipping ?? null),
-      qty: patch.qty !== undefined ? patch.qty : (existing?.qty ?? null),
-    }
-
-    if (existing && existing.source === 'manual' && existing.capturedAt.getTime() >= cutoff) {
-      updates.push({ id: existing.id, ...merged })
-    } else {
-      inserts.push({
-        partId,
-        period: patch.period,
-        ...merged,
-        source: 'manual',
-        sampleSize: null,
-      })
-    }
-  }
-
-  if (updates.length > 0) {
-    // One statement for every coalesced window. The casts are load-bearing:
-    // a VALUES list of bound parameters otherwise types its columns as text,
-    // and a NULL column would have no type at all.
-    const values = updates.map(
-      (row) =>
-        sql`(${row.id}::integer, ${row.price}::numeric(10,2), ${row.shipping}::numeric(10,2), ${row.qty}::integer)`,
-    )
-
-    await db.execute(sql`
-      UPDATE ${marketSnapshots} AS m
-      SET price = v.price, shipping = v.shipping, qty = v.qty, captured_at = now()
-      FROM (VALUES ${sql.join(values, sql`, `)}) AS v(id, price, shipping, qty)
-      WHERE m.id = v.id
-    `)
-  }
-
-  if (inserts.length > 0) {
-    await db.insert(marketSnapshots).values(inserts)
-  }
+  // The statement either succeeds atomically or throws; its write cardinality is
+  // deterministic from the validated patches and does not depend on driver-specific
+  // execute() result shapes (Neon HTTP vs PGlite in tests).
+  return windows.length + (active ? 1 : 0)
 }
 
-/** Single-window convenience wrapper over the batch path. */
-export async function saveManualSnapshot(
-  partId: number,
-  period: Period,
-  patch: ManualSnapshotPatch,
-): Promise<void> {
-  await saveManualSnapshots(partId, [{ period, ...patch }])
-}
+// ─── Sync writes ──────────────────────────────────────────────────────────────
 
-export type SyncSnapshot = {
+export type SyncSoldSnapshot = {
   partId: number
   period: Period
   price: number | null
   shipping: number | null
-  qty: number | null
-  source: SnapshotSource
+  soldQty: number | null
+  source: 'ebay_insights'
   sampleSize: number | null
 }
 
-/** Batch-appends snapshots produced by a sync run. */
-export async function insertSnapshots(rows: SyncSnapshot[]): Promise<number> {
+export async function insertSoldSnapshots(rows: SyncSoldSnapshot[]): Promise<number> {
   if (rows.length === 0) return 0
   await db.insert(marketSnapshots).values(
     rows.map((row) => ({
@@ -414,21 +482,156 @@ export async function insertSnapshots(rows: SyncSnapshot[]): Promise<number> {
       period: row.period,
       price: toDbNumeric(row.price),
       shipping: toDbNumeric(row.shipping),
-      qty: row.qty,
+      soldQty: row.soldQty,
       source: row.source,
+      priceBasis: 'sold' as const,
       sampleSize: row.sampleSize,
     })),
   )
   return rows.length
 }
 
+export type SyncActiveSnapshot = {
+  partId: number
+  askingPrice: number | null
+  askingShipping: number | null
+  activeQty: number | null
+  sampleSize: number | null
+  broadMatchCount: number | null
+  mpnRejectedCount: number | null
+  conditionRejectedCount: number | null
+  truncated: boolean
+}
+
+export async function insertActiveSnapshots(rows: SyncActiveSnapshot[]): Promise<number> {
+  if (rows.length === 0) return 0
+  await db.insert(activeMarketSnapshots).values(
+    rows.map((row) => ({
+      ...row,
+      source: 'ebay_browse' as const,
+      askingPrice: toDbNumeric(row.askingPrice),
+      askingShipping: toDbNumeric(row.askingShipping),
+    })),
+  )
+  return rows.length
+}
+
+// ─── Historical trend summaries ──────────────────────────────────────────────
+
+const HISTORY_PERIOD_PREFERENCE: Period[] = ['30d', '7d', '90d']
+const HISTORY_LOOKBACK_DAYS = 365
+
+function pickHistoricalTrend(
+  rows: { period: Period; capturedAt: Date; value: number | null }[],
+): { trend: ReturnType<typeof timeTrend>; period: Period | null } {
+  let fallback: { trend: ReturnType<typeof timeTrend>; period: Period | null } = {
+    trend: timeTrend([]),
+    period: null,
+  }
+
+  for (const period of HISTORY_PERIOD_PREFERENCE) {
+    const trend = timeTrend(
+      rows.filter((row) => row.period === period).map((row) => ({ at: row.capturedAt, value: row.value })),
+    )
+    if (trend.qualified) return { trend, period }
+    if (trend.points > fallback.trend.points) fallback = { trend, period }
+  }
+  return fallback
+}
+
+export async function loadTrendSummaries(partIds: number[]): Promise<Map<number, TrendSummary>> {
+  const summaries = new Map<number, TrendSummary>()
+  if (partIds.length === 0) return summaries
+
+  const cutoff = new Date(Date.now() - HISTORY_LOOKBACK_DAYS * 86_400_000)
+  const [soldRows, activeRows] = await Promise.all([
+    db
+      .select({
+        partId: marketSnapshots.partId,
+        period: marketSnapshots.period,
+        price: marketSnapshots.price,
+        shipping: marketSnapshots.shipping,
+        soldQty: marketSnapshots.soldQty,
+        priceBasis: marketSnapshots.priceBasis,
+        capturedAt: marketSnapshots.capturedAt,
+      })
+      .from(marketSnapshots)
+      .where(
+        and(
+          inArray(marketSnapshots.partId, partIds),
+          inArray(marketSnapshots.period, HISTORY_PERIOD_PREFERENCE),
+          gte(marketSnapshots.capturedAt, cutoff),
+        ),
+      )
+      .orderBy(marketSnapshots.partId, marketSnapshots.capturedAt),
+    db
+      .select({
+        partId: activeMarketSnapshots.partId,
+        activeQty: activeMarketSnapshots.activeQty,
+        capturedAt: activeMarketSnapshots.capturedAt,
+      })
+      .from(activeMarketSnapshots)
+      .where(
+        and(
+          inArray(activeMarketSnapshots.partId, partIds),
+          gte(activeMarketSnapshots.capturedAt, cutoff),
+        ),
+      )
+      .orderBy(activeMarketSnapshots.partId, activeMarketSnapshots.capturedAt),
+  ])
+
+  for (const partId of partIds) {
+    const partSold = soldRows.filter((row) => row.partId === partId)
+
+    const priceRows = partSold
+      .filter((row) => row.priceBasis === 'sold')
+      .map((row) => ({
+        period: row.period,
+        capturedAt: row.capturedAt,
+        value:
+          toNumber(row.price) == null
+            ? null
+            : (toNumber(row.price) as number) + (toNumber(row.shipping) ?? 0),
+      }))
+    const market = pickHistoricalTrend(priceRows)
+
+    const demandRows = partSold.map((row) => ({
+      period: row.period,
+      capturedAt: row.capturedAt,
+      value: row.soldQty == null ? null : row.soldQty / PERIOD_DAYS[row.period],
+    }))
+    const demand = pickHistoricalTrend(demandRows)
+
+    const supply = timeTrend(
+      activeRows
+        .filter((row) => row.partId === partId)
+        .map((row) => ({ at: row.capturedAt, value: row.activeQty })),
+    )
+
+    summaries.set(partId, {
+      marketPctPer30d: market.trend.pctPer30d,
+      marketPoints: market.trend.points,
+      marketSpanDays: market.trend.spanDays,
+      marketPeriod: market.period,
+      demandPctPer30d: demand.trend.pctPer30d,
+      demandPoints: demand.trend.points,
+      demandSpanDays: demand.trend.spanDays,
+      demandPeriod: demand.period,
+      supplyPctPer30d: supply.pctPer30d,
+      supplyPoints: supply.points,
+      supplySpanDays: supply.spanDays,
+    })
+  }
+
+  return summaries
+}
+
 // ─── Sync runs ────────────────────────────────────────────────────────────────
 
 export async function startSyncRun(trigger: 'cron' | 'manual'): Promise<number> {
   const rows = await db.insert(ebaySyncRuns).values({ trigger }).returning({ id: ebaySyncRuns.id })
-  const row = rows[0]
-  if (!row) throw new Error('Could not open a sync run')
-  return row.id
+  if (!rows[0]) throw new Error('Could not open a sync run')
+  return rows[0].id
 }
 
 export async function finishSyncRun(
@@ -439,6 +642,8 @@ export async function finishSyncRun(
     partsProcessed?: number
     partsFailed?: number
     snapshotsWritten?: number
+    soldSnapshotsWritten?: number
+    activeSnapshotsWritten?: number
     error?: string | null
   },
 ): Promise<void> {
@@ -450,6 +655,8 @@ export async function finishSyncRun(
       partsProcessed: result.partsProcessed ?? 0,
       partsFailed: result.partsFailed ?? 0,
       snapshotsWritten: result.snapshotsWritten ?? 0,
+      soldSnapshotsWritten: result.soldSnapshotsWritten ?? 0,
+      activeSnapshotsWritten: result.activeSnapshotsWritten ?? 0,
       error: result.error ?? null,
       finishedAt: new Date(),
     })
@@ -460,7 +667,6 @@ export async function recentSyncRuns(limit = 10) {
   return db.select().from(ebaySyncRuns).orderBy(desc(ebaySyncRuns.startedAt)).limit(limit)
 }
 
-/** Cheap connectivity probe used by the settings page. */
 export async function databaseReachable(): Promise<boolean> {
   try {
     await db.execute(sql`select 1`)

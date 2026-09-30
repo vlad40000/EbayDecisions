@@ -2,91 +2,146 @@ export type TrendDirection = 'rising' | 'falling' | 'flat' | 'unknown'
 
 export type Trend = {
   direction: TrendDirection
-  /** Least-squares slope in raw units per period step. */
   slope: number | null
-  /** Slope as a percent of the series mean — comparable across parts. */
-  pctPerPeriod: number | null
-  /** True when the move is large enough to act on. */
+  pctPer30d: number | null
   strong: boolean
-  /** How many points the fit used. Below 3, treat the read as weak. */
   points: number
+  spanDays: number
+  qualified: boolean
 }
 
 const FLAT_THRESHOLD_PCT = 2
 const STRONG_THRESHOLD_PCT = 6
+const DAY_MS = 86_400_000
 
 const EMPTY_TREND: Trend = {
   direction: 'unknown',
   slope: null,
-  pctPerPeriod: null,
+  pctPer30d: null,
   strong: false,
   points: 0,
+  spanDays: 0,
+  qualified: false,
 }
 
-/**
- * Ordinary least-squares slope over a series indexed 0..n-1.
- *
- * Nulls are dropped, and the surviving points keep their *original* spacing —
- * so a part missing its 6-month reading does not get a falsely steep slope from
- * having its remaining points bunched together.
- */
-export function linearTrend(series: readonly (number | null)[]): Trend {
-  const points: { x: number; y: number }[] = []
-  series.forEach((y, x) => {
-    if (y != null && Number.isFinite(y)) points.push({ x, y })
-  })
+type XY = { x: number; y: number }
 
+function fit(points: XY[], qualified: boolean, spanDays: number): Trend {
   const n = points.length
-  if (n < 2) return { ...EMPTY_TREND, points: n }
+  if (n < 2) return { ...EMPTY_TREND, points: n, spanDays, qualified: false }
 
-  const meanX = points.reduce((a, p) => a + p.x, 0) / n
-  const meanY = points.reduce((a, p) => a + p.y, 0) / n
+  const meanX = points.reduce((sum, point) => sum + point.x, 0) / n
+  const meanY = points.reduce((sum, point) => sum + point.y, 0) / n
+  const denominator = points.reduce((sum, point) => sum + (point.x - meanX) ** 2, 0)
+  if (denominator === 0) {
+    return { ...EMPTY_TREND, points: n, spanDays, qualified: false }
+  }
 
-  const denominator = points.reduce((a, p) => a + (p.x - meanX) ** 2, 0)
-  if (denominator === 0) return { ...EMPTY_TREND, points: n }
+  const slope =
+    points.reduce((sum, point) => sum + (point.x - meanX) * (point.y - meanY), 0) /
+    denominator
+  const pctPer30d = meanY !== 0 ? ((slope * 30) / Math.abs(meanY)) * 100 : null
 
-  const slope = points.reduce((a, p) => a + (p.x - meanX) * (p.y - meanY), 0) / denominator
-
-  // Normalising by the mean makes a $2/period move on a $30 gasket comparable
-  // to a $2/period move on a $200 board.
-  const pctPerPeriod = meanY !== 0 ? (slope / Math.abs(meanY)) * 100 : null
+  if (!qualified) {
+    return { ...EMPTY_TREND, slope, pctPer30d, points: n, spanDays, qualified: false }
+  }
 
   let direction: TrendDirection = 'flat'
-  if (pctPerPeriod == null) {
+  if (pctPer30d == null) {
     direction = slope > 0 ? 'rising' : slope < 0 ? 'falling' : 'flat'
-  } else if (Math.abs(pctPerPeriod) >= FLAT_THRESHOLD_PCT) {
-    direction = pctPerPeriod > 0 ? 'rising' : 'falling'
+  } else if (Math.abs(pctPer30d) >= FLAT_THRESHOLD_PCT) {
+    direction = pctPer30d > 0 ? 'rising' : 'falling'
   }
 
   return {
     direction,
     slope,
-    pctPerPeriod,
-    strong: pctPerPeriod != null && Math.abs(pctPerPeriod) >= STRONG_THRESHOLD_PCT,
+    pctPer30d,
+    strong: pctPer30d != null && Math.abs(pctPer30d) >= STRONG_THRESHOLD_PCT,
     points: n,
+    spanDays,
+    qualified: true,
   }
 }
 
-/** Fitted value at index i, for drawing the trend line alongside the data. */
-export function trendValueAt(
-  series: readonly (number | null)[],
+/**
+ * Trend across real calendar timestamps.
+ *
+ * Multiple observations on one UTC calendar date collapse to the latest one so
+ * a correction saved minutes later cannot masquerade as a 30-day market move.
+ * A history read is actionable only after at least 3 distinct dates spanning at
+ * least 14 days; before that its slope is exposed for diagnostics but its
+ * direction remains unknown.
+ */
+export function timeTrend(
+  input: readonly { at: string | Date; value: number | null }[],
+  options: { minPoints?: number; minSpanDays?: number } = {},
+): Trend {
+  const minPoints = options.minPoints ?? 3
+  const minSpanDays = options.minSpanDays ?? 14
+
+  const byDay = new Map<string, { at: number; value: number }>()
+  for (const point of input) {
+    if (point.value == null || !Number.isFinite(point.value)) continue
+    const at = point.at instanceof Date ? point.at.getTime() : new Date(point.at).getTime()
+    if (!Number.isFinite(at)) continue
+    const day = new Date(at).toISOString().slice(0, 10)
+    const existing = byDay.get(day)
+    if (!existing || at >= existing.at) byDay.set(day, { at, value: point.value })
+  }
+
+  const values = [...byDay.values()].sort((a, b) => a.at - b.at)
+  if (values.length < 2) return { ...EMPTY_TREND, points: values.length }
+
+  const first = values[0]!.at
+  const last = values[values.length - 1]!.at
+  const spanDays = (last - first) / DAY_MS
+  const points = values.map((point) => ({ x: (point.at - first) / DAY_MS, y: point.value }))
+  return fit(points, values.length >= minPoints && spanDays >= minSpanDays, spanDays)
+}
+
+/**
+ * Context-only curve across unequal lookback windows. x is real days from the
+ * oldest reference point toward today, so 1yr→6m is not treated as the same
+ * distance as 30d→7d. This is not a historical time series.
+ */
+export function spacedWindowTrend(
+  input: readonly { daysAgo: number; value: number | null }[],
+): Trend {
+  const points = input
+    .filter((point): point is { daysAgo: number; value: number } =>
+      point.value != null && Number.isFinite(point.value),
+    )
+    .map((point) => ({ x: -point.daysAgo, y: point.value }))
+
+  if (points.length < 2) return { ...EMPTY_TREND, points: points.length }
+  const xs = points.map((point) => point.x)
+  const spanDays = Math.max(...xs) - Math.min(...xs)
+  // The window curve is always labelled separately; "qualified" only means the
+  // arithmetic fit is usable, not that it is genuine longitudinal history.
+  return fit(points, true, spanDays)
+}
+
+/** Fitted value at a given real-day x position for charting the window curve. */
+export function trendValueAtX(
+  input: readonly { x: number; value: number | null }[],
   trend: Trend,
-  index: number,
+  x: number,
 ): number | null {
   if (trend.slope == null) return null
-  const points: { x: number; y: number }[] = []
-  series.forEach((y, x) => {
-    if (y != null && Number.isFinite(y)) points.push({ x, y })
-  })
+  const points = input.filter(
+    (point): point is { x: number; value: number } =>
+      point.value != null && Number.isFinite(point.value),
+  )
   if (points.length < 2) return null
-  const meanX = points.reduce((a, p) => a + p.x, 0) / points.length
-  const meanY = points.reduce((a, p) => a + p.y, 0) / points.length
+  const meanX = points.reduce((sum, point) => sum + point.x, 0) / points.length
+  const meanY = points.reduce((sum, point) => sum + point.value, 0) / points.length
   const intercept = meanY - trend.slope * meanX
-  return intercept + trend.slope * index
+  return intercept + trend.slope * x
 }
 
 export function median(values: readonly number[]): number | null {
-  const sorted = values.filter((v) => Number.isFinite(v)).slice().sort((a, b) => a - b)
+  const sorted = values.filter((value) => Number.isFinite(value)).slice().sort((a, b) => a - b)
   if (sorted.length === 0) return null
   const mid = Math.floor(sorted.length / 2)
   if (sorted.length % 2 === 1) return sorted[mid] as number

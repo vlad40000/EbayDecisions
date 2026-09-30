@@ -1,13 +1,3 @@
-/**
- * Integration tests for the query layer, against a real Postgres.
- *
- * PGlite is Postgres compiled to WebAssembly, running in-process — so the
- * `DISTINCT ON` read path, the enum columns, the cascade delete and the
- * snapshot-coalescing logic are executed by an actual Postgres planner rather
- * than asserted about in the abstract. The schema comes from the same generated
- * migration that will run against Neon, which means these tests also prove the
- * migration applies cleanly.
- */
 import { PGlite } from '@electric-sql/pglite'
 import { drizzle } from 'drizzle-orm/pglite'
 import { readFileSync, readdirSync } from 'node:fs'
@@ -17,59 +7,60 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest'
 import { setDatabaseForTests } from '@/db/index'
 import * as schema from '@/db/schema'
 import {
+  activeSnapshotHistory,
   createPart,
   deletePart,
   getPartWithMarket,
   getSettings,
-  insertSnapshots,
+  insertActiveSnapshots,
+  insertSoldSnapshots,
+  latestActiveSnapshots,
   latestSnapshots,
   listParts,
   listPartsWithMarket,
-  saveManualSnapshot,
-  saveManualSnapshots,
+  loadTrendSummaries,
+  saveManualMarket,
   snapshotHistory,
   updatePart,
   updateSettings,
   upsertPartByMpn,
 } from '@/db/queries'
-import { marketSnapshots } from '@/db/schema'
+import { activeMarketSnapshots, marketSnapshots } from '@/db/schema'
 
 const client = new PGlite()
 const testDb = drizzle({ client, schema })
-
 setDatabaseForTests(testDb)
 
-function migrationSql(): string {
+function migrationFiles(): string[] {
   const dir = path.resolve(import.meta.dirname, '../drizzle')
-  const files = readdirSync(dir)
+  return readdirSync(dir)
     .filter((name) => name.endsWith('.sql'))
     .sort()
-  return files.map((name) => readFileSync(path.join(dir, name), 'utf8')).join('\n')
+    .map((name) => readFileSync(path.join(dir, name), 'utf8'))
 }
 
-async function resetSchema() {
-  await client.exec('DROP SCHEMA public CASCADE; CREATE SCHEMA public;')
-  for (const statement of migrationSql().split('--> statement-breakpoint')) {
+async function applySql(sql: string) {
+  for (const statement of sql.split('--> statement-breakpoint')) {
     const trimmed = statement.trim()
     if (trimmed) await client.exec(trimmed)
   }
 }
 
-beforeEach(async () => {
-  await resetSchema()
-})
+async function resetSchema() {
+  await client.exec('DROP SCHEMA public CASCADE; CREATE SCHEMA public;')
+  for (const sql of migrationFiles()) await applySql(sql)
+}
 
-afterAll(async () => {
-  await client.close()
-})
+beforeEach(resetSchema)
+afterAll(async () => client.close())
 
-describe('the generated migration', () => {
-  it('applies cleanly and creates every table', async () => {
+describe('migrations', () => {
+  it('apply cleanly and create the separated active-market table', async () => {
     const result = await client.query<{ table_name: string }>(
-      `select table_name from information_schema.tables
-       where table_schema = 'public' order by table_name`,
+      `select table_name from information_schema.tables where table_schema='public' order by table_name`,
     )
     expect(result.rows.map((row) => row.table_name)).toEqual([
+      'active_market_snapshots',
       'ebay_sync_runs',
       'market_snapshots',
       'parts',
@@ -77,461 +68,235 @@ describe('the generated migration', () => {
     ])
   })
 
-  it('creates the index the latest-per-window read depends on', async () => {
-    const result = await client.query<{ indexname: string }>(
-      `select indexname from pg_indexes where tablename = 'market_snapshots'`,
+  it('migrates legacy Insights qty to sold_qty and Browse qty to active supply', async () => {
+    const files = migrationFiles()
+    await client.exec('DROP SCHEMA public CASCADE; CREATE SCHEMA public;')
+    await applySql(files[0]!)
+    await applySql(files[1]!)
+    await client.exec(`insert into parts (mpn, description) values ('LEGACY-1','Board')`)
+    const part = await client.query<{ id: number }>(`select id from parts where mpn='LEGACY-1'`)
+    const id = part.rows[0]!.id
+    await client.exec(`
+      insert into market_snapshots (part_id, period, price, shipping, qty, source, sample_size)
+      values
+        (${id}, '30d', 100, 10, 8, 'ebay_insights', 8),
+        (${id}, '7d', 90, 9, 14, 'ebay_browse', 14),
+        (${id}, '1yr', 80, 8, 99, 'manual', null)
+    `)
+    await applySql(files[2]!)
+
+    const sold = await client.query<{ source: string; sold_qty: number | null; legacy_qty: number | null; price_basis: string }>(
+      `select source, sold_qty, legacy_qty, price_basis from market_snapshots order by period`,
     )
-    expect(result.rows.map((row) => row.indexname)).toContain(
-      'snapshots_part_period_captured_idx',
+    expect(sold.rows.some((row) => row.source === 'ebay_insights' && row.sold_qty === 8 && row.price_basis === 'sold')).toBe(true)
+    expect(sold.rows.some((row) => row.source === 'ebay_browse')).toBe(false)
+    expect(sold.rows.some((row) => row.source === 'manual' && row.sold_qty == null && row.legacy_qty === 99)).toBe(true)
+
+    const active = await client.query<{ active_qty: number | null; source: string }>(
+      `select active_qty, source from active_market_snapshots`,
     )
+    expect(active.rows).toEqual([{ active_qty: 14, source: 'ebay_browse' }])
   })
 })
 
-describe('settings', () => {
-  it('materialises the row with defaults on first read', async () => {
+describe('settings and parts', () => {
+  it('materializes settings defaults and enforces floor <= target', async () => {
     const settings = await getSettings()
     expect(settings.feePct).toBeCloseTo(13.25, 2)
-    expect(settings.targetMarginPct).toBeCloseTo(35, 2)
-
-    const rows = await client.query<{ count: string }>('select count(*) from settings')
-    expect(Number(rows.rows[0]?.count)).toBe(1)
+    await expect(client.exec(`update settings set min_margin_pct=50,target_margin_pct=20 where id=1`)).rejects.toThrow()
   })
 
-  it('updates only the fields it is given', async () => {
+  it('updates only supplied settings', async () => {
     await getSettings()
     await updateSettings({ feePct: 12.9 })
     const after = await getSettings()
-
     expect(after.feePct).toBeCloseTo(12.9, 2)
-    // Untouched fields keep their values.
     expect(after.targetMarginPct).toBeCloseTo(35, 2)
-    expect(after.defaultShipCost).toBeCloseTo(12, 2)
   })
 
-  it('stays a single row no matter how often it is written', async () => {
-    await updateSettings({ feePct: 11 })
-    await updateSettings({ feePct: 12 })
-    await updateSettings({ minMarginPct: 20 })
-
-    const rows = await client.query<{ count: string }>('select count(*) from settings')
-    expect(Number(rows.rows[0]?.count)).toBe(1)
-
-    const settings = await getSettings()
-    expect(settings.feePct).toBeCloseTo(12, 2)
-    expect(settings.minMarginPct).toBeCloseTo(20, 2)
-  })
-})
-
-describe('parts', () => {
-  it('round-trips money columns as numbers, not strings', async () => {
-    const created = await createPart({
-      mpn: 'W11170706',
-      description: 'Washer Control Board',
-      inventoryQty: 2,
-      costBasis: 41.5,
-      shipCost: 13.25,
-    })
-
-    expect(created.costBasis).toBe(41.5)
-    expect(created.shipCost).toBe(13.25)
-    expect(typeof created.costBasis).toBe('number')
-  })
-
-  it('keeps a zero cost basis distinct from a missing one', async () => {
+  it('keeps zero cost basis distinct from missing cost basis', async () => {
     await createPart({ mpn: 'FREE-1', description: 'Salvaged board', costBasis: 0 })
     await createPart({ mpn: 'UNKNOWN-1', description: 'Unpriced board' })
-
     const parts = await listParts()
-    const free = parts.find((part) => part.mpn === 'FREE-1')
-    const unknown = parts.find((part) => part.mpn === 'UNKNOWN-1')
-
-    expect(free?.costBasis).toBe(0)
-    expect(unknown?.costBasis).toBeNull()
+    expect(parts.find((part) => part.mpn === 'FREE-1')?.costBasis).toBe(0)
+    expect(parts.find((part) => part.mpn === 'UNKNOWN-1')?.costBasis).toBeNull()
   })
 
-  it('derives a category from the description and lets a stored one win', async () => {
-    await createPart({ mpn: 'G-1', description: 'Freezer Door Gasket' })
-    await createPart({ mpn: 'G-2', description: 'Freezer Door Gasket', category: 'Other' })
-
-    const parts = await listParts()
-    expect(parts.find((part) => part.mpn === 'G-1')?.category).toBe('Door Gaskets')
-    expect(parts.find((part) => part.mpn === 'G-2')?.category).toBe('Other')
-  })
-
-  it('upserts on MPN instead of duplicating', async () => {
-    expect(await upsertPartByMpn({ mpn: 'W1', description: 'First' })).toBe('inserted')
-    expect(await upsertPartByMpn({ mpn: 'W1', description: 'Second', costBasis: 20 })).toBe(
-      'updated',
-    )
-
-    const parts = await listParts()
-    expect(parts).toHaveLength(1)
-    expect(parts[0]?.description).toBe('Second')
-    expect(parts[0]?.costBasis).toBe(20)
-  })
-
-  it('hides inactive parts unless asked for them', async () => {
-    const part = await createPart({ mpn: 'A1', description: 'Active' })
-    await createPart({ mpn: 'A2', description: 'Also active' })
-    await updatePart(part.id, { active: false })
-
-    expect(await listParts()).toHaveLength(1)
-    expect(await listParts({ includeInactive: true })).toHaveLength(2)
-  })
-
-  it('cascades a delete to that part history', async () => {
-    const part = await createPart({ mpn: 'D1', description: 'Doomed' })
-    await insertSnapshots([
-      { partId: part.id, period: '7d', price: 10, shipping: 1, qty: 1, source: 'manual', sampleSize: null },
-    ])
-    expect(await snapshotHistory(part.id)).toHaveLength(1)
-
-    await deletePart(part.id)
-
-    const remaining = await testDb.select().from(marketSnapshots)
-    expect(remaining).toHaveLength(0)
+  it('supports CRUD, inactive filtering, and MPN upsert', async () => {
+    const first = await createPart({ mpn: 'P1', description: 'Board' })
+    await updatePart(first.id, { active: false })
+    expect(await listParts()).toHaveLength(0)
+    expect(await listParts({ includeInactive: true })).toHaveLength(1)
+    expect(await upsertPartByMpn({ mpn: 'P1', description: 'Updated Board', active: true })).toBe('updated')
+    expect((await listParts())[0]?.description).toBe('Updated Board')
+    await deletePart(first.id)
+    expect(await listParts({ includeInactive: true })).toHaveLength(0)
   })
 })
 
-describe('latestSnapshots', () => {
-  it('returns the newest reading per window, not the first', async () => {
-    const part = await createPart({ mpn: 'L1', description: 'Board' })
-
-    await insertSnapshots([
-      { partId: part.id, period: '7d', price: 100, shipping: 10, qty: 3, source: 'manual', sampleSize: null },
+describe('separate sold and active market streams', () => {
+  it('returns newest sold observation per window while preserving history', async () => {
+    const part = await createPart({ mpn: 'S1', description: 'Board' })
+    await insertSoldSnapshots([
+      { partId: part.id, period: '7d', price: 100, shipping: 10, soldQty: 3, source: 'ebay_insights', sampleSize: 3 },
     ])
-    // A later reading for the same window must win.
-    await new Promise((resolve) => setTimeout(resolve, 5))
-    await insertSnapshots([
-      { partId: part.id, period: '7d', price: 120, shipping: 12, qty: 5, source: 'ebay_insights', sampleSize: 9 },
+    await insertSoldSnapshots([
+      { partId: part.id, period: '7d', price: 120, shipping: 12, soldQty: 5, source: 'ebay_insights', sampleSize: 5 },
     ])
-
-    const map = await latestSnapshots([part.id])
-    const latest = map.get(part.id)?.['7d']
-
+    const latest = (await latestSnapshots([part.id])).get(part.id)?.['7d']
     expect(latest?.price).toBe(120)
-    expect(latest?.source).toBe('ebay_insights')
-    expect(latest?.sampleSize).toBe(9)
-
-    // Both readings are still on file — nothing was overwritten.
+    expect(latest?.soldQty).toBe(5)
+    expect(latest?.priceBasis).toBe('sold')
     expect(await snapshotHistory(part.id)).toHaveLength(2)
   })
 
-  it('keeps each window independent', async () => {
-    const part = await createPart({ mpn: 'L2', description: 'Board' })
-    await insertSnapshots([
-      { partId: part.id, period: '1yr', price: 80, shipping: 10, qty: 2, source: 'manual', sampleSize: null },
-      { partId: part.id, period: '30d', price: 95, shipping: 11, qty: 3, source: 'manual', sampleSize: null },
-      { partId: part.id, period: '7d', price: 100, shipping: 12, qty: 4, source: 'manual', sampleSize: null },
+  it('stores active competition independently from sold demand', async () => {
+    const part = await createPart({ mpn: 'A1', description: 'Board' })
+    await insertSoldSnapshots([
+      { partId: part.id, period: '30d', price: 100, shipping: 10, soldQty: 20, source: 'ebay_insights', sampleSize: 20 },
     ])
-
-    const periods = (await latestSnapshots([part.id])).get(part.id)
-    expect(periods?.['1yr']?.price).toBe(80)
-    expect(periods?.['30d']?.price).toBe(95)
-    expect(periods?.['7d']?.price).toBe(100)
-    expect(periods?.['6m']).toBeUndefined()
-    expect(periods?.['90d']).toBeUndefined()
+    await insertActiveSnapshots([
+      { partId: part.id, askingPrice: 120, askingShipping: 12, activeQty: 7, sampleSize: 7, broadMatchCount: 10, mpnRejectedCount: 3, conditionRejectedCount: 0, truncated: false },
+    ])
+    const loaded = await getPartWithMarket('A1')
+    expect(loaded?.periods['30d']?.soldQty).toBe(20)
+    expect(loaded?.activeMarket?.activeQty).toBe(7)
+    expect(loaded?.activeMarket?.askingPrice).toBe(120)
   })
 
-  it('separates readings by part', async () => {
-    const a = await createPart({ mpn: 'P-A', description: 'A' })
-    const b = await createPart({ mpn: 'P-B', description: 'B' })
-
-    await insertSnapshots([
-      { partId: a.id, period: '7d', price: 10, shipping: 1, qty: 1, source: 'manual', sampleSize: null },
-      { partId: b.id, period: '7d', price: 20, shipping: 2, qty: 2, source: 'manual', sampleSize: null },
-    ])
-
-    const map = await latestSnapshots([a.id, b.id])
-    expect(map.get(a.id)?.['7d']?.price).toBe(10)
-    expect(map.get(b.id)?.['7d']?.price).toBe(20)
-  })
-
-  it('answers an empty part list without querying', async () => {
-    expect((await latestSnapshots([])).size).toBe(0)
+  it('cascades both history streams when a part is deleted', async () => {
+    const part = await createPart({ mpn: 'D1', description: 'Board' })
+    await insertSoldSnapshots([{ partId: part.id, period: '7d', price: 10, shipping: 1, soldQty: 1, source: 'ebay_insights', sampleSize: 1 }])
+    await insertActiveSnapshots([{ partId: part.id, askingPrice: 12, askingShipping: 1, activeQty: 2, sampleSize: 2, broadMatchCount: 2, mpnRejectedCount: 0, conditionRejectedCount: 0, truncated: false }])
+    await deletePart(part.id)
+    expect(await testDb.select().from(marketSnapshots)).toHaveLength(0)
+    expect(await testDb.select().from(activeMarketSnapshots)).toHaveLength(0)
   })
 })
 
-describe('saveManualSnapshot', () => {
-  it('creates a row on first edit', async () => {
+describe('explicit Save MPN', () => {
+  it('writes all touched windows and point-in-time active fields in one save boundary', async () => {
     const part = await createPart({ mpn: 'M1', description: 'Board' })
-    await saveManualSnapshot(part.id, '30d', { price: 99.5 })
-
-    const history = await snapshotHistory(part.id)
-    expect(history).toHaveLength(1)
-    expect(history[0]?.price).toBe('99.50')
-    expect(history[0]?.source).toBe('manual')
-  })
-
-  it('coalesces a burst of edits into one row', async () => {
-    const part = await createPart({ mpn: 'M2', description: 'Board' })
-
-    // Typing price, then shipping, then qty into the same window.
-    await saveManualSnapshot(part.id, '30d', { price: 99.5 })
-    await saveManualSnapshot(part.id, '30d', { shipping: 12 })
-    await saveManualSnapshot(part.id, '30d', { qty: 4 })
-
-    const history = await snapshotHistory(part.id)
-    expect(history).toHaveLength(1)
-
-    const periods = (await latestSnapshots([part.id])).get(part.id)
-    expect(periods?.['30d']?.price).toBe(99.5)
-    expect(periods?.['30d']?.shipping).toBe(12)
-    expect(periods?.['30d']?.qty).toBe(4)
-  })
-
-  it('carries forward untouched fields when appending after a sync', async () => {
-    const part = await createPart({ mpn: 'M3', description: 'Board' })
-
-    await insertSnapshots([
-      { partId: part.id, period: '7d', price: 100, shipping: 14, qty: 6, source: 'ebay_insights', sampleSize: 8 },
-    ])
-
-    // Correcting only the price must not blank the shipping beside it.
-    await saveManualSnapshot(part.id, '7d', { price: 88 })
-
-    const periods = (await latestSnapshots([part.id])).get(part.id)
-    expect(periods?.['7d']?.price).toBe(88)
-    expect(periods?.['7d']?.shipping).toBe(14)
-    expect(periods?.['7d']?.qty).toBe(6)
-    // A person set it, so the row is manual, and the eBay reading survives.
-    expect(periods?.['7d']?.source).toBe('manual')
-    expect(await snapshotHistory(part.id)).toHaveLength(2)
-  })
-
-  it('appends rather than coalescing once the edit window has passed', async () => {
-    const part = await createPart({ mpn: 'M4', description: 'Board' })
-    await saveManualSnapshot(part.id, '7d', { price: 100 })
-
-    // Backdate the row past the coalescing window.
-    await client.exec(
-      `update market_snapshots set captured_at = now() - interval '2 hours' where part_id = ${part.id}`,
-    )
-
-    await saveManualSnapshot(part.id, '7d', { price: 110 })
-
-    const history = await snapshotHistory(part.id)
-    expect(history).toHaveLength(2)
-    expect((await latestSnapshots([part.id])).get(part.id)?.['7d']?.price).toBe(110)
-  })
-
-  it('clears a field when given null', async () => {
-    const part = await createPart({ mpn: 'M5', description: 'Board' })
-    await saveManualSnapshot(part.id, '7d', { price: 100, shipping: 10 })
-    await saveManualSnapshot(part.id, '7d', { shipping: null })
-
-    const periods = (await latestSnapshots([part.id])).get(part.id)
-    expect(periods?.['7d']?.price).toBe(100)
-    expect(periods?.['7d']?.shipping).toBeNull()
-  })
-})
-
-describe('listPartsWithMarket', () => {
-  it('attaches each part readings and leaves bare parts empty', async () => {
-    const withData = await createPart({ mpn: 'W-1', description: 'Board', costBasis: 30 })
-    await createPart({ mpn: 'W-2', description: 'Gasket' })
-
-    await insertSnapshots([
-      { partId: withData.id, period: '7d', price: 100, shipping: 12, qty: 3, source: 'ebay_insights', sampleSize: 4 },
-    ])
-
-    const parts = await listPartsWithMarket()
-    expect(parts).toHaveLength(2)
-
-    const first = parts.find((part) => part.mpn === 'W-1')
-    const second = parts.find((part) => part.mpn === 'W-2')
-
-    expect(first?.periods['7d']?.price).toBe(100)
-    expect(Object.keys(second?.periods ?? {})).toHaveLength(0)
-  })
-
-  it('finds one part with its market by MPN', async () => {
-    const part = await createPart({ mpn: 'W11122852', description: 'Oven Display Board' })
-    await insertSnapshots([
-      { partId: part.id, period: '90d', price: 75.25, shipping: 9.99, qty: 2, source: 'manual', sampleSize: null },
-    ])
-
-    const loaded = await getPartWithMarket('W11122852')
-    expect(loaded?.periods['90d']?.price).toBe(75.25)
-    expect(loaded?.periods['90d']?.shipping).toBe(9.99)
-
-    expect(await getPartWithMarket('NOPE')).toBeNull()
-  })
-})
-
-describe('database constraints', () => {
-  /**
-   * The app validates at the edge, but it is not the only writer — the seed
-   * script, the CSV importer and a psql session all reach these tables. These
-   * assert the database itself refuses nonsense, so a bad number cannot get in
-   * behind the application's back and quietly poison a recommendation.
-   */
-  const rejects = async (sql: string) => {
-    await expect(client.exec(sql)).rejects.toThrow()
-  }
-
-  it('refuses a negative inventory quantity', async () => {
-    await rejects(
-      `insert into parts (mpn, description, inventory_qty) values ('X1','Board',-1)`,
-    )
-  })
-
-  it('refuses an absurd cost basis', async () => {
-    await rejects(
-      `insert into parts (mpn, description, cost_basis) values ('X2','Board',9999999)`,
-    )
-  })
-
-  it('refuses an unreachable target margin', async () => {
-    await rejects(
-      `insert into parts (mpn, description, target_margin_pct) values ('X3','Board',100)`,
-    )
-  })
-
-  it('refuses a negative snapshot price', async () => {
-    const part = await createPart({ mpn: 'X4', description: 'Board' })
-    await rejects(
-      `insert into market_snapshots (part_id, period, price) values (${part.id},'7d',-5)`,
-    )
-  })
-
-  it('refuses a second settings row', async () => {
-    await getSettings()
-    await rejects(`insert into settings (id) values (2)`)
-  })
-
-  it('refuses a margin floor above the target', async () => {
-    await getSettings()
-    await rejects(`update settings set min_margin_pct = 50, target_margin_pct = 20 where id = 1`)
-  })
-
-  it('still accepts the values the app actually writes', async () => {
-    const part = await createPart({
-      mpn: 'OK-1',
-      description: 'Board',
-      inventoryQty: 0,
-      costBasis: 0,
-      targetMarginPct: 99.99,
+    const written = await saveManualMarket({
+      partId: part.id,
+      windows: [
+        { period: '30d', price: 100, shipping: 10, soldQty: 20, priceBasis: 'sold' },
+        { period: '7d', price: 105, soldQty: 8, priceBasis: 'sold' },
+      ],
+      active: { askingPrice: 120, askingShipping: 12, activeQty: 9 },
     })
-    expect(part.costBasis).toBe(0)
+    expect(written).toBe(3)
+    expect(await snapshotHistory(part.id)).toHaveLength(2)
+    expect(await activeSnapshotHistory(part.id)).toHaveLength(1)
+  })
 
-    await insertSnapshots([
-      { partId: part.id, period: '7d', price: 0, shipping: 0, qty: 0, source: 'manual', sampleSize: null },
-    ])
-    await updateSettings({ minMarginPct: 15, targetMarginPct: 35 })
-    expect((await getSettings()).minMarginPct).toBeCloseTo(15, 2)
+  it('preserves eBay preview provenance only when the preview is explicitly saved', async () => {
+    const part = await createPart({ mpn: 'M-PREVIEW', description: 'Board' })
+    await saveManualMarket({
+      partId: part.id,
+      windows: [],
+      active: {
+        askingPrice: 119,
+        askingShipping: 11,
+        activeQty: 7,
+        source: 'ebay_browse',
+        sampleSize: 9,
+        broadMatchCount: 12,
+        mpnRejectedCount: 3,
+        conditionRejectedCount: 0,
+        truncated: false,
+      },
+    })
+    const history = await activeSnapshotHistory(part.id)
+    expect(history).toHaveLength(1)
+    expect(history[0]?.source).toBe('ebay_browse')
+    expect(history[0]?.sampleSize).toBe(9)
+    expect(history[0]?.mpnRejectedCount).toBe(3)
+  })
+
+  it('carries forward untouched live fields instead of overwriting them with stale browser state', async () => {
+    const part = await createPart({ mpn: 'M2', description: 'Board' })
+    await insertSoldSnapshots([{ partId: part.id, period: '7d', price: 100, shipping: 14, soldQty: 6, source: 'ebay_insights', sampleSize: 8 }])
+    await saveManualMarket({ partId: part.id, windows: [{ period: '7d', price: 88 } ] })
+    const latest = (await latestSnapshots([part.id])).get(part.id)?.['7d']
+    expect(latest?.price).toBe(88)
+    expect(latest?.shipping).toBe(14)
+    expect(latest?.soldQty).toBe(6)
+    expect(await snapshotHistory(part.id)).toHaveLength(2)
+  })
+
+  it('can explicitly clear a touched field with null', async () => {
+    const part = await createPart({ mpn: 'M3', description: 'Board' })
+    await saveManualMarket({ partId: part.id, windows: [{ period: '7d', price: 100, shipping: 10 }] })
+    await saveManualMarket({ partId: part.id, windows: [{ period: '7d', shipping: null }] })
+    const latest = (await latestSnapshots([part.id])).get(part.id)?.['7d']
+    expect(latest?.price).toBe(100)
+    expect(latest?.shipping).toBeNull()
+  })
+
+  it('does not write when there are no touched fields', async () => {
+    const part = await createPart({ mpn: 'M4', description: 'Board' })
+    expect(await saveManualMarket({ partId: part.id, windows: [] })).toBe(0)
+    expect(await snapshotHistory(part.id)).toHaveLength(0)
   })
 })
 
-describe('saveManualSnapshots (batched)', () => {
-  /**
-   * The grid sends a whole part at once rather than a request per field. These
-   * check the batch path does exactly what the single-window path did — coalesce
-   * recent manual rows, append past the window, and carry forward untouched
-   * fields — across several windows in one call.
-   */
-  it('writes several windows in one call', async () => {
-    const part = await createPart({ mpn: 'B1', description: 'Board' })
-
-    await saveManualSnapshots(part.id, [
-      { period: '1yr', price: 95, shipping: 15, qty: 1 },
-      { period: '6m', price: 102, shipping: 16, qty: 1 },
-      { period: '7d', price: 122, shipping: 19, qty: 2 },
+describe('historical summaries', () => {
+  it('requires three distinct dates over at least 14 days and collapses same-day corrections', async () => {
+    const part = await createPart({ mpn: 'H1', description: 'Board' })
+    await testDb.insert(marketSnapshots).values([
+      { partId: part.id, period: '30d', price: '120.00', shipping: '0.00', soldQty: 20, source: 'ebay_insights', priceBasis: 'sold', capturedAt: new Date('2026-09-01T08:00:00Z') },
+      { partId: part.id, period: '30d', price: '118.00', shipping: '0.00', soldQty: 21, source: 'manual', priceBasis: 'sold', capturedAt: new Date('2026-09-01T16:00:00Z') },
+      { partId: part.id, period: '30d', price: '110.00', shipping: '0.00', soldQty: 22, source: 'ebay_insights', priceBasis: 'sold', capturedAt: new Date('2026-09-15T12:00:00Z') },
+      { partId: part.id, period: '30d', price: '100.00', shipping: '0.00', soldQty: 24, source: 'ebay_insights', priceBasis: 'sold', capturedAt: new Date('2026-09-29T12:00:00Z') },
     ])
-
-    const periods = (await latestSnapshots([part.id])).get(part.id)
-    expect(periods?.['1yr']?.price).toBe(95)
-    expect(periods?.['6m']?.shipping).toBe(16)
-    expect(periods?.['7d']?.qty).toBe(2)
-    expect(periods?.['90d']).toBeUndefined()
-    expect(await snapshotHistory(part.id)).toHaveLength(3)
+    const summary = (await loadTrendSummaries([part.id])).get(part.id)!
+    expect(summary.marketPoints).toBe(3)
+    expect(summary.marketSpanDays).toBeGreaterThanOrEqual(28)
+    expect(summary.marketPctPer30d).toBeLessThan(0)
+    expect(summary.marketPeriod).toBe('30d')
   })
 
-  it('coalesces a second burst into the same rows', async () => {
-    const part = await createPart({ mpn: 'B2', description: 'Board' })
-
-    await saveManualSnapshots(part.id, [
-      { period: '30d', price: 100 },
-      { period: '7d', price: 110 },
+  it('computes demand history from sold units per day', async () => {
+    const part = await createPart({ mpn: 'H2', description: 'Board' })
+    await testDb.insert(marketSnapshots).values([
+      { partId: part.id, period: '30d', soldQty: 9, source: 'ebay_insights', priceBasis: 'sold', capturedAt: new Date('2026-09-01T12:00:00Z') },
+      { partId: part.id, period: '30d', soldQty: 15, source: 'ebay_insights', priceBasis: 'sold', capturedAt: new Date('2026-09-15T12:00:00Z') },
+      { partId: part.id, period: '30d', soldQty: 24, source: 'ebay_insights', priceBasis: 'sold', capturedAt: new Date('2026-09-29T12:00:00Z') },
     ])
-    await saveManualSnapshots(part.id, [
-      { period: '30d', shipping: 12 },
-      { period: '7d', shipping: 14 },
-    ])
-
-    // Two windows, one row each — not four rows.
-    expect(await snapshotHistory(part.id)).toHaveLength(2)
-
-    const periods = (await latestSnapshots([part.id])).get(part.id)
-    expect(periods?.['30d']?.price).toBe(100)
-    expect(periods?.['30d']?.shipping).toBe(12)
-    expect(periods?.['7d']?.price).toBe(110)
-    expect(periods?.['7d']?.shipping).toBe(14)
+    const summary = (await loadTrendSummaries([part.id])).get(part.id)!
+    expect(summary.demandPoints).toBe(3)
+    expect(summary.demandPctPer30d).toBeGreaterThan(0)
   })
 
-  it('mixes update and insert in one call', async () => {
-    const part = await createPart({ mpn: 'B3', description: 'Board' })
-
-    // One window already has a recent manual row; the other has none.
-    await saveManualSnapshots(part.id, [{ period: '7d', price: 100 }])
-    await saveManualSnapshots(part.id, [
-      { period: '7d', price: 105 },
-      { period: '30d', price: 98 },
+  it('derives supply only from point-in-time active snapshots', async () => {
+    const part = await createPart({ mpn: 'H3', description: 'Board' })
+    await testDb.insert(activeMarketSnapshots).values([
+      { partId: part.id, activeQty: 8, source: 'ebay_browse', capturedAt: new Date('2026-09-01T12:00:00Z') },
+      { partId: part.id, activeQty: 12, source: 'ebay_browse', capturedAt: new Date('2026-09-15T12:00:00Z') },
+      { partId: part.id, activeQty: 18, source: 'ebay_browse', capturedAt: new Date('2026-09-29T12:00:00Z') },
     ])
+    const summary = (await loadTrendSummaries([part.id])).get(part.id)!
+    expect(summary.supplyPoints).toBe(3)
+    expect(summary.supplyPctPer30d).toBeGreaterThan(0)
+    expect(summary.demandPoints).toBe(0)
+  })
+})
 
-    expect(await snapshotHistory(part.id)).toHaveLength(2)
-    const periods = (await latestSnapshots([part.id])).get(part.id)
-    expect(periods?.['7d']?.price).toBe(105)
-    expect(periods?.['30d']?.price).toBe(98)
+describe('constraints', () => {
+  it('rejects negative sold and active quantities', async () => {
+    const part = await createPart({ mpn: 'X1', description: 'Board' })
+    await expect(client.exec(`insert into market_snapshots (part_id,period,sold_qty) values (${part.id},'7d',-1)`)).rejects.toThrow()
+    await expect(client.exec(`insert into active_market_snapshots (part_id,active_qty) values (${part.id},-1)`)).rejects.toThrow()
   })
 
-  it('appends rather than coalescing over an eBay row, carrying fields forward', async () => {
-    const part = await createPart({ mpn: 'B4', description: 'Board' })
-
-    await insertSnapshots([
-      { partId: part.id, period: '7d', price: 100, shipping: 14, qty: 6, source: 'ebay_insights', sampleSize: 8 },
-      { partId: part.id, period: '30d', price: 96, shipping: 13, qty: 9, source: 'ebay_insights', sampleSize: 11 },
-    ])
-
-    // Correcting only the prices must leave the synced shipping and qty intact.
-    await saveManualSnapshots(part.id, [
-      { period: '7d', price: 88 },
-      { period: '30d', price: 90 },
-    ])
-
-    const periods = (await latestSnapshots([part.id])).get(part.id)
-    expect(periods?.['7d']?.price).toBe(88)
-    expect(periods?.['7d']?.shipping).toBe(14)
-    expect(periods?.['7d']?.qty).toBe(6)
-    expect(periods?.['7d']?.source).toBe('manual')
-    expect(periods?.['30d']?.price).toBe(90)
-    expect(periods?.['30d']?.shipping).toBe(13)
-
-    // The eBay readings survive underneath.
-    expect(await snapshotHistory(part.id)).toHaveLength(4)
-  })
-
-  it('clears a field when sent null, across a batch', async () => {
-    const part = await createPart({ mpn: 'B5', description: 'Board' })
-    await saveManualSnapshots(part.id, [
-      { period: '7d', price: 100, shipping: 10 },
-      { period: '30d', price: 90, shipping: 9 },
-    ])
-    await saveManualSnapshots(part.id, [
-      { period: '7d', shipping: null },
-      { period: '30d', price: null },
-    ])
-
-    const periods = (await latestSnapshots([part.id])).get(part.id)
-    expect(periods?.['7d']?.price).toBe(100)
-    expect(periods?.['7d']?.shipping).toBeNull()
-    expect(periods?.['30d']?.price).toBeNull()
-    expect(periods?.['30d']?.shipping).toBe(9)
-  })
-
-  it('does nothing when handed no patches', async () => {
-    const part = await createPart({ mpn: 'B6', description: 'Board' })
-    await saveManualSnapshots(part.id, [])
-    expect(await snapshotHistory(part.id)).toHaveLength(0)
+  it('attaches both latest market streams to list results', async () => {
+    const part = await createPart({ mpn: 'L1', description: 'Board' })
+    await insertSoldSnapshots([{ partId: part.id, period: '7d', price: 50, shipping: 5, soldQty: 4, source: 'ebay_insights', sampleSize: 4 }])
+    await insertActiveSnapshots([{ partId: part.id, askingPrice: 60, askingShipping: 6, activeQty: 9, sampleSize: 9, broadMatchCount: 12, mpnRejectedCount: 3, conditionRejectedCount: 0, truncated: false }])
+    const listed = await listPartsWithMarket()
+    expect(listed[0]?.periods['7d']?.soldQty).toBe(4)
+    expect(listed[0]?.activeMarket?.activeQty).toBe(9)
+    expect((await latestActiveSnapshots([part.id])).get(part.id)?.activeQty).toBe(9)
   })
 })

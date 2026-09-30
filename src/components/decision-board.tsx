@@ -3,16 +3,12 @@
 import Link from 'next/link'
 import { Fragment, useMemo, useState } from 'react'
 
-import { money, percent, signedPercent } from '@/lib/format'
 import { ACTION_LABELS, ACTION_PRIORITY, type Action } from '@/lib/decisions'
+import { money, percent, signedPercent } from '@/lib/format'
+import type { TrendBasis } from '@/lib/types'
 
 import { ActionBadge, Chip, EmptyState } from './ui'
 
-/**
- * Plain, serialisable shape so the server can compute every decision and hand
- * the client a finished row. The engine never runs in the browser — one source
- * of truth, and the fee settings never have to be shipped down.
- */
 export type BoardRow = {
   mpn: string
   description: string
@@ -26,23 +22,30 @@ export type BoardRow = {
   marginPct: number | null
   potentialDollars: number | null
   suggestedListPrice: number | null
-  costTrendDirection: 'rising' | 'falling' | 'flat' | 'unknown'
-  costTrendPct: number | null
+  marketTrendDirection: 'rising' | 'falling' | 'flat' | 'unknown'
+  marketTrendPct: number | null
+  marketTrendBasis: TrendBasis
+  demandTrendDirection: 'rising' | 'falling' | 'flat' | 'unknown'
+  demandTrendPct: number | null
+  supplyTrendDirection: 'rising' | 'falling' | 'flat' | 'unknown'
+  supplyTrendPct: number | null
   action: Action
   reason: string
   notes: string[]
-  askingPricesOnly: boolean
-  thinData: boolean
+  provenance: 'sold' | 'asking' | 'mixed' | 'unknown'
 }
 
 type SortKey = 'recommended' | 'potential' | 'margin' | 'mpn'
-
 const SORTS: { key: SortKey; label: string }[] = [
   { key: 'recommended', label: 'Recommended' },
   { key: 'potential', label: '$ at stake' },
   { key: 'margin', label: 'Margin %' },
   { key: 'mpn', label: 'MPN' },
 ]
+
+function trendTone(direction: BoardRow['marketTrendDirection']) {
+  return direction === 'rising' ? 'text-good' : direction === 'falling' ? 'text-bad' : 'text-ink-faint'
+}
 
 export function DecisionBoard({ rows }: { rows: BoardRow[] }) {
   const [actionFilter, setActionFilter] = useState<Action | 'ALL'>('ALL')
@@ -58,7 +61,6 @@ export function DecisionBoard({ rows }: { rows: BoardRow[] }) {
 
   const visible = useMemo(() => {
     const query = search.trim().toLowerCase()
-
     const filtered = rows.filter((row) => {
       if (actionFilter !== 'ALL' && row.action !== actionFilter) return false
       if (!query) return true
@@ -69,30 +71,20 @@ export function DecisionBoard({ rows }: { rows: BoardRow[] }) {
       )
     })
 
-    const sorted = [...filtered]
-    sorted.sort((a, b) => {
-      switch (sort) {
-        case 'potential':
-          return Math.abs(b.potentialDollars ?? 0) - Math.abs(a.potentialDollars ?? 0)
-        case 'margin':
-          return (b.marginPct ?? -Infinity) - (a.marginPct ?? -Infinity)
-        case 'mpn':
-          return a.mpn.localeCompare(b.mpn)
-        default: {
-          const byAction = ACTION_PRIORITY[a.action] - ACTION_PRIORITY[b.action]
-          if (byAction !== 0) return byAction
-          return Math.abs(b.potentialDollars ?? 0) - Math.abs(a.potentialDollars ?? 0)
-        }
-      }
+    return [...filtered].sort((a, b) => {
+      if (sort === 'potential') return Math.abs(b.potentialDollars ?? 0) - Math.abs(a.potentialDollars ?? 0)
+      if (sort === 'margin') return (b.marginPct ?? -Infinity) - (a.marginPct ?? -Infinity)
+      if (sort === 'mpn') return a.mpn.localeCompare(b.mpn)
+      const byAction = ACTION_PRIORITY[a.action] - ACTION_PRIORITY[b.action]
+      return byAction !== 0 ? byAction : Math.abs(b.potentialDollars ?? 0) - Math.abs(a.potentialDollars ?? 0)
     })
-    return sorted
   }, [rows, actionFilter, search, sort])
 
   if (rows.length === 0) {
     return (
       <EmptyState
         title="No parts yet"
-        body="Seed the catalogue with pnpm db:seed, or add parts one at a time from the Inventory page."
+        body="Seed the catalogue with pnpm db:seed, or add parts one at a time from Inventory."
         cta={{ href: '/inventory', label: 'Go to Inventory' }}
       />
     )
@@ -147,9 +139,7 @@ export function DecisionBoard({ rows }: { rows: BoardRow[] }) {
             className="field px-2 py-1 font-mono text-xs outline-none"
           >
             {SORTS.map((option) => (
-              <option key={option.key} value={option.key}>
-                {option.label}
-              </option>
+              <option key={option.key} value={option.key}>{option.label}</option>
             ))}
           </select>
         </label>
@@ -157,31 +147,16 @@ export function DecisionBoard({ rows }: { rows: BoardRow[] }) {
 
       <div className="border-line overflow-x-auto rounded border">
         <table className="w-full border-collapse text-sm" style={{ minWidth: 980 }}>
-          <caption className="sr-only">
-            Listing recommendations for each part, with the margin and trend behind each one.
-          </caption>
+          <caption className="sr-only">Listing recommendations with economics and qualified market signals.</caption>
           <thead>
             <tr className="bg-surface border-line border-b">
-              {[
-                { label: 'Action', align: 'left' },
-                { label: 'MPN', align: 'left' },
-                { label: 'Description', align: 'left' },
-                { label: 'Qty', align: 'right' },
-                { label: 'Cost', align: 'right' },
-                { label: 'Market', align: 'right' },
-                { label: 'Net', align: 'right' },
-                { label: 'Margin', align: 'right' },
-                { label: 'Trend', align: 'right' },
-                { label: 'At stake', align: 'right' },
-              ].map((header) => (
+              {['Action', 'MPN', 'Description', 'Qty', 'Cost', 'Market', 'Net', 'Margin', 'Price trend', 'At stake'].map((label, index) => (
                 <th
-                  key={header.label}
+                  key={label}
                   scope="col"
-                  className={`text-ink-faint px-3 py-2.5 text-xs font-medium tracking-widest whitespace-nowrap uppercase ${
-                    header.align === 'right' ? 'text-right' : 'text-left'
-                  }`}
+                  className={`text-ink-faint px-3 py-2.5 text-xs font-medium tracking-widest whitespace-nowrap uppercase ${index >= 3 ? 'text-right' : 'text-left'}`}
                 >
-                  {header.label}
+                  {label}
                 </th>
               ))}
             </tr>
@@ -197,68 +172,32 @@ export function DecisionBoard({ rows }: { rows: BoardRow[] }) {
                       index % 2 === 1 ? 'bg-white/[0.015]' : ''
                     } ${open ? 'bg-good/[0.05]' : ''}`}
                   >
-                    <td className="px-3 py-2.5">
-                      <ActionBadge action={row.action} />
-                    </td>
-                    <td className="text-info px-3 py-2.5 font-mono text-xs whitespace-nowrap">
-                      {row.mpn}
-                    </td>
+                    <td className="px-3 py-2.5"><ActionBadge action={row.action} /></td>
+                    <td className="text-info px-3 py-2.5 font-mono text-xs whitespace-nowrap">{row.mpn}</td>
                     <td className="text-ink max-w-64 truncate px-3 py-2.5">{row.description}</td>
-                    <td className="text-ink-dim px-3 py-2.5 text-right font-mono">
-                      {row.inventoryQty}
-                    </td>
-                    <td className="text-ink-dim px-3 py-2.5 text-right font-mono text-xs">
-                      {money(row.costBasis)}
-                    </td>
+                    <td className="text-ink-dim px-3 py-2.5 text-right font-mono">{row.inventoryQty}</td>
+                    <td className="text-ink-dim px-3 py-2.5 text-right font-mono text-xs">{money(row.costBasis)}</td>
                     <td className="text-ink px-3 py-2.5 text-right font-mono text-xs">
-                      {row.marketPrice == null
-                        ? '—'
-                        : money(row.marketPrice + (row.marketShipping ?? 0))}
+                      {row.marketPrice == null ? '—' : money(row.marketPrice + (row.marketShipping ?? 0))}
                     </td>
-                    <td className="text-ink px-3 py-2.5 text-right font-mono text-xs">
-                      {money(row.netProceeds)}
-                    </td>
+                    <td className="text-ink px-3 py-2.5 text-right font-mono text-xs">{money(row.netProceeds)}</td>
                     <td className="px-3 py-2.5 text-right font-mono text-xs">
-                      <span
-                        className={
-                          row.marginDollars == null
-                            ? 'text-ink-ghost'
-                            : row.marginDollars < 0
-                              ? 'text-bad'
-                              : 'text-good'
-                        }
-                      >
+                      <span className={row.marginDollars == null ? 'text-ink-ghost' : row.marginDollars < 0 ? 'text-bad' : 'text-good'}>
                         {money(row.marginDollars)}
                       </span>
                       <span className="text-ink-faint ml-1.5">{percent(row.marginPct, 0)}</span>
                     </td>
                     <td className="px-3 py-2.5 text-right">
-                      {row.costTrendDirection === 'unknown' ? (
+                      {row.marketTrendDirection === 'unknown' ? (
                         <span className="text-ink-ghost font-mono text-xs">—</span>
                       ) : (
-                        <span
-                          className={`font-mono text-xs ${
-                            row.costTrendDirection === 'flat'
-                              ? 'text-ink-faint'
-                              : row.costTrendDirection === 'rising'
-                                ? 'text-good'
-                                : 'text-bad'
-                          }`}
-                        >
-                          {signedPercent(row.costTrendPct)}
+                        <span className={`font-mono text-xs ${trendTone(row.marketTrendDirection)}`}>
+                          {signedPercent(row.marketTrendPct)}
                         </span>
                       )}
                     </td>
                     <td className="px-3 py-2.5 text-right font-mono text-xs">
-                      <span
-                        className={
-                          row.potentialDollars == null
-                            ? 'text-ink-ghost'
-                            : row.potentialDollars < 0
-                              ? 'text-bad'
-                              : 'text-ink'
-                        }
-                      >
+                      <span className={row.potentialDollars == null ? 'text-ink-ghost' : row.potentialDollars < 0 ? 'text-bad' : 'text-ink'}>
                         {money(row.potentialDollars)}
                       </span>
                     </td>
@@ -268,25 +207,23 @@ export function DecisionBoard({ rows }: { rows: BoardRow[] }) {
                     <tr className="border-line bg-good/[0.03] border-b">
                       <td colSpan={10} className="px-4 py-3">
                         <p className="text-ink mb-2 text-sm">{row.reason}</p>
-
                         {row.notes.length > 0 && (
                           <ul className="text-ink-dim mb-3 space-y-0.5 text-xs">
-                            {row.notes.map((note) => (
-                              <li key={note}>· {note}</li>
-                            ))}
+                            {row.notes.map((note) => <li key={note}>· {note}</li>)}
                           </ul>
                         )}
-
                         <div className="flex flex-wrap items-center gap-2">
                           {row.suggestedListPrice != null && (
-                            <Chip tone="info" title="Item price that hits your target margin at the observed shipping.">
-                              List at {money(row.suggestedListPrice)}
-                            </Chip>
+                            <Chip tone="info">List at {money(row.suggestedListPrice)} for target margin</Chip>
                           )}
-                          {row.askingPricesOnly && (
-                            <Chip tone="warn">Asking prices, not sold comps</Chip>
-                          )}
-                          {row.thinData && <Chip tone="warn">Thin data</Chip>}
+                          <Chip tone={row.provenance === 'sold' ? 'good' : row.provenance === 'asking' ? 'warn' : 'dim'}>
+                            Price basis: {row.provenance}
+                          </Chip>
+                          <Chip tone={row.marketTrendBasis === 'history' ? 'good' : 'dim'}>
+                            Price {row.marketTrendBasis}: {signedPercent(row.marketTrendPct)} / 30d
+                          </Chip>
+                          <Chip tone="dim">Demand: {signedPercent(row.demandTrendPct)} / 30d</Chip>
+                          <Chip tone="dim">Supply: {signedPercent(row.supplyTrendPct)} / 30d</Chip>
                           <Link
                             href={`/inventory/${encodeURIComponent(row.mpn)}`}
                             className="text-info hover:text-good ml-auto font-mono text-xs transition-colors"
@@ -305,9 +242,7 @@ export function DecisionBoard({ rows }: { rows: BoardRow[] }) {
       </div>
 
       {visible.length === 0 && (
-        <p className="text-ink-faint py-6 text-center text-sm">
-          Nothing matches that filter.
-        </p>
+        <p className="text-ink-faint py-6 text-center text-sm">Nothing matches that filter.</p>
       )}
     </div>
   )
