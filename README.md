@@ -61,21 +61,35 @@ Research is append-only. Repeating the same research later creates a new dated s
 
 Legacy and automated snapshot rows that predate the session model remain valid with `research_session_id = NULL`. The migration does not invent historical sessions.
 
-## Manual first, not manual forever
+## MPN-only eBay research
 
-The current production workflow is deliberately manual-first. A user transcribes eBay Product Research data and explicitly saves it. This gives the product a trustworthy baseline and prevents unreviewed external data from contaminating history.
+The primary research workflow follows the proven Roadrunner Parts Ledger pattern: every MPN has direct **Active eBay** and **Sold eBay** research links.
 
-The intended next automation layer is **assisted research**, not an unattended catalogue sweep:
+The search query is deliberately restricted to the supplied MPN only.
 
-1. User selects one MPN or a small working set.
-2. An authorized adapter attempts to retrieve SOLD research.
-3. Retrieved values and provenance are shown for review.
-4. The user accepts/corrects the values.
-5. **SAVE RESEARCH** persists the dated session.
+Do not append:
 
-There is no scheduled Vercel research cron and no automatic 40,000-part research loop.
+- brand
+- machine model
+- part description
+- category
+- compatibility terms
+- appliance type
+- inferred keywords
 
-The repo still contains optional eBay adapter code and sync auditing for controlled future use. SOLD observations and active asking-price observations remain separate data streams.
+Active research uses:
+
+```text
+https://www.ebay.com/sch/i.html?_nkw=<MPN>
+```
+
+Sold research uses the same MPN-only query with eBay's completed/sold filters:
+
+```text
+https://www.ebay.com/sch/i.html?_nkw=<MPN>&LH_Sold=1&LH_Complete=1
+```
+
+The user reviews those results, enters the five Product Research windows, and presses **SAVE RESEARCH**. There is no autosave, polling, scheduled catalogue sweep, or automatic 40,000-part research loop.
 
 ## Market Opportunities
 
