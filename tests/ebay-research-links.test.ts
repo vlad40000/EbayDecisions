@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   buildEbayActiveResearchUrl,
+  buildEbayProductResearchUrl,
   buildEbaySoldResearchUrl,
   normalizeResearchMpn,
 } from '@/lib/ebay/research-links'
@@ -33,6 +34,38 @@ describe('MPN-only eBay research links', () => {
     expect(url).not.toContain('dryer')
     expect(url).not.toContain('model')
     expect(url).not.toContain('compatible')
+  })
+
+  it('builds MPN-only Seller Hub Product Research links for every lookback window', () => {
+    const nowMs = new Date('2026-10-01T12:00:00.000Z').getTime()
+    const expectedDays = {
+      '7d': 7,
+      '30d': 30,
+      '90d': 90,
+      '6m': 182,
+      '1yr': 365,
+    } as const
+
+    for (const [period, days] of Object.entries(expectedDays)) {
+      const url = new URL(
+        buildEbayProductResearchUrl('  W11204517  ', period as keyof typeof expectedDays, nowMs),
+      )
+
+      expect(url.hostname).toBe('www.ebay.com')
+      expect(url.pathname).toBe('/sh/research')
+      expect(url.searchParams.get('keywords')).toBe('W11204517')
+      expect(url.searchParams.get('dayRange')).toBe(String(days))
+      expect(url.searchParams.get('categoryId')).toBe('0')
+      expect(url.searchParams.get('tabName')).toBe('SOLD')
+      expect(url.searchParams.get('marketplace')).toBe('EBAY-US')
+      expect(Number(url.searchParams.get('endDate'))).toBe(nowMs)
+      expect(Number(url.searchParams.get('startDate'))).toBe(nowMs - days * 86_400_000)
+
+      const decoded = decodeURIComponent(url.toString())
+      expect(decoded).not.toContain('Whirlpool')
+      expect(decoded).not.toContain('dryer')
+      expect(decoded).not.toContain('compatible')
+    }
   })
 
   it('only trims the supplied MPN', () => {
