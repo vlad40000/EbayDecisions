@@ -1,6 +1,7 @@
 'use client'
 
 import Link from 'next/link'
+import { useRouter } from 'next/navigation'
 import { useEffect, useMemo, useState } from 'react'
 
 import { saveResearch, type ResearchWindowFormInput } from '@/app/(app)/tracker/actions'
@@ -59,6 +60,7 @@ function preservedWindow(
 }
 
 export function QuickMarketGrid({ rows }: { rows: QuickTrackerRow[] }) {
+  const router = useRouter()
   const [drafts, setDrafts] = useState<QuickDrafts>({})
   const [saving, setSaving] = useState<number | null>(null)
   const [saved, setSaved] = useState<number | null>(null)
@@ -111,6 +113,7 @@ export function QuickMarketGrid({ rows }: { rows: QuickTrackerRow[] }) {
       return next
     })
     setSaved(row.partId)
+    router.refresh()
   }
 
   if (rows.length === 0) {
