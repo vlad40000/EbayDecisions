@@ -57,6 +57,7 @@ export default async function TrackerPage(props: { searchParams: PageSearchParam
   }
 
   const rows: ResearchTrackerRow[] = result?.rows ?? []
+  const researchNowMs = Date.now()
   const firstRow = result && result.total > 0 ? (result.page - 1) * result.pageSize + 1 : 0
   const lastRow = result ? Math.min(result.page * result.pageSize, result.total) : 0
 
@@ -128,7 +129,7 @@ export default async function TrackerPage(props: { searchParams: PageSearchParam
           <div className="text-ink-faint mb-2 font-mono text-xs">
             Showing {firstRow}–{lastRow} of {result.total} MPNs
           </div>
-          <ResearchTracker rows={rows} />
+          <ResearchTracker rows={rows} researchNowMs={researchNowMs} />
 
           <div className="mt-3 flex items-center justify-between gap-3">
             <span className="text-ink-faint font-mono text-xs">
