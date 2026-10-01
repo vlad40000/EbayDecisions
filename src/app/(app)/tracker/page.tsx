@@ -69,9 +69,9 @@ export default async function TrackerPage(props: { searchParams: PageSearchParam
 
       <div className="mb-4">
         <Notice tone="info">
-          Open <strong>Active eBay</strong> and <strong>Sold eBay</strong> from an MPN row. Both links
-          search eBay using only the supplied MPN—no brand, model, description, category, compatibility,
-          or machine terms are added. Enter the research values, then <strong>SAVE RESEARCH</strong>.
+          Open <strong>Active eBay</strong> and <strong>Sold eBay</strong> from an MPN row. Both use only
+          the supplied MPN. <strong>Capture Active</strong> can append a point-in-time Active snapshot;
+          Sold research remains separate and is saved only through <strong>SAVE RESEARCH</strong>.
         </Notice>
       </div>
 
