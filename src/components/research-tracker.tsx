@@ -65,15 +65,7 @@ function lastResearchedLabel(iso: string | null): string {
   return `${days} days ago`
 }
 
-function decimalDraft(value: number | null): string {
-  return value == null ? '' : value.toFixed(2)
-}
-
-function integerDraft(value: number | null): string {
-  return value == null ? '' : String(Math.round(value))
-}
-
-export function ResearchTracker({ rows, researchNowMs }: { rows: ResearchTrackerRow[]; researchNowMs: number }) {
+export function ResearchTracker({ rows }: { rows: ResearchTrackerRow[] }) {
   const router = useRouter()
   const [open, setOpen] = useState<number | null>(rows.length === 1 ? rows[0]!.partId : null)
   const [drafts, setDrafts] = useState<Drafts>({})
@@ -394,15 +386,20 @@ export function ResearchTracker({ rows, researchNowMs }: { rows: ResearchTracker
                               return (
                                 <tr key={period} className="border-line/50 border-b last:border-0">
                                   <td className="px-1.5 py-2">
-                                    <a
-                                      href={buildEbayProductResearchUrl(row.mpn, period, researchNowMs)}
-                                      target="_blank"
-                                      rel="noreferrer"
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        window.open(
+                                          buildEbayProductResearchUrl(row.mpn, period, Date.now()),
+                                          '_blank',
+                                          'noopener,noreferrer',
+                                        )
+                                      }}
                                       title={`Open eBay Product Research for ${row.mpn} · ${PERIOD_LABELS[period]}`}
                                       className="text-info hover:text-good inline-flex items-center gap-1 font-mono text-xs font-semibold transition-colors"
                                     >
                                       {PERIOD_LABELS[period]} <span aria-hidden>↗</span>
-                                    </a>
+                                    </button>
                                   </td>
                                   {fields.map(({ key, integer, suffix }) => (
                                     <td key={key} className="px-1.5 py-1.5">
