@@ -651,6 +651,7 @@ export type TrackerResearchRow = {
   inventoryQty: number
   lastResearchedAt: string | null
   periods: Partial<Record<Period, PeriodObservation>>
+  activeMarket: ActiveMarketObservation | null
 }
 
 export type TrackerResearchPage = {
@@ -740,6 +741,8 @@ export async function listTrackerResearchParts(
           .where(inArray(marketSnapshots.researchSessionId, sessionIds))
           .orderBy(marketSnapshots.researchSessionId, marketSnapshots.period)
 
+  const activeByPart = await latestActiveSnapshots(pageRows.map((row) => row.partId))
+
   const periodsBySession = new Map<number, Partial<Record<Period, PeriodObservation>>>()
   for (const row of periodRows) {
     if (row.researchSessionId == null) continue
@@ -758,6 +761,7 @@ export async function listTrackerResearchParts(
       lastResearchedAt: row.lastResearchedAt?.toISOString() ?? null,
       periods:
         row.researchSessionId == null ? {} : periodsBySession.get(row.researchSessionId) ?? {},
+      activeMarket: activeByPart.get(row.partId) ?? null,
     })),
     total,
     page,

@@ -8,7 +8,6 @@ type BrowseItemSummary = {
   title?: string
   price?: { value?: string; currency?: string }
   shippingOptions?: { shippingCost?: { value?: string } }[]
-  condition?: string
 }
 
 type BrowseResponse = {
@@ -30,14 +29,12 @@ export type BrowseResult = {
 
 const PAGE_LIMIT = 200
 
-function isUsedCondition(condition: string | undefined): boolean {
-  if (!condition) return false
-  const normalized = condition.toLowerCase()
-  return (
-    normalized.includes('used') ||
-    normalized.includes('pre-owned') ||
-    normalized.includes('preowned')
-  )
+/** The research population is defined by the supplied MPN only. */
+export function buildActiveSearchParams(mpn: string): Record<string, string> {
+  return {
+    q: mpn.trim(),
+    limit: String(PAGE_LIMIT),
+  }
 }
 
 export async function fetchActiveMarket(
@@ -46,20 +43,14 @@ export async function fetchActiveMarket(
 ): Promise<BrowseResult> {
   const response = await ebayGet<BrowseResponse>(
     '/buy/browse/v1/item_summary/search',
-    {
-      q: mpn,
-      limit: String(PAGE_LIMIT),
-      // eBay supports the broad USED condition filter for Browse and Insights.
-      // We still check the returned condition defensively.
-      filter: 'conditions:{USED}',
-    },
+    buildActiveSearchParams(mpn),
     config.browseScope,
     config,
   )
 
   const returned = response.itemSummaries ?? []
   const exactMpn = returned.filter((item) => item.title && titleMatchesMpn(item.title, mpn))
-  const qualified = exactMpn.filter((item) => isUsedCondition(item.condition))
+  const qualified = exactMpn
 
   const prices: number[] = []
   const shippingCosts: number[] = []
@@ -87,7 +78,7 @@ export async function fetchActiveMarket(
     sampleSize: prices.length,
     broadMatchCount,
     mpnRejectedCount: returned.length - exactMpn.length,
-    conditionRejectedCount: exactMpn.length - qualified.length,
+    conditionRejectedCount: 0,
     truncated,
   }
 }

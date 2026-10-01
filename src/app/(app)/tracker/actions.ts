@@ -3,11 +3,68 @@
 import { revalidatePath } from 'next/cache'
 import { z } from 'zod'
 
-import { saveMarketResearchSession } from '@/db/queries'
+import { getPartByMpn, insertActiveSnapshots, saveMarketResearchSession } from '@/db/queries'
+import { fetchActiveMarket } from '@/lib/ebay/browse'
 import { requireSession } from '@/lib/session'
 import { PERIODS } from '@/lib/types'
 
 const MAX_AMOUNT = 1_000_000
+
+
+const activeCaptureSchema = z.object({
+  partId: z.coerce.number().int().positive(),
+  mpn: z.string().trim().min(1).max(64),
+})
+
+export type CaptureActiveResult =
+  | { ok: true; capturedAt: string }
+  | { ok: false; error: string }
+
+export async function captureActiveResearch(input: {
+  partId: number
+  mpn: string
+}): Promise<CaptureActiveResult> {
+  await requireSession()
+
+  const parsed = activeCaptureSchema.safeParse(input)
+  if (!parsed.success) {
+    return { ok: false, error: parsed.error.issues[0]?.message ?? 'That MPN is not valid.' }
+  }
+
+  const part = await getPartByMpn(parsed.data.mpn)
+  if (!part || part.id !== parsed.data.partId) {
+    return { ok: false, error: 'The MPN no longer matches this inventory row.' }
+  }
+
+  try {
+    const active = await fetchActiveMarket(parsed.data.mpn)
+    await insertActiveSnapshots([
+      {
+        partId: part.id,
+        askingPrice: active.askingPrice,
+        askingShipping: active.askingShipping,
+        activeQty: active.activeQty,
+        sampleSize: active.sampleSize,
+        broadMatchCount: active.broadMatchCount,
+        mpnRejectedCount: active.mpnRejectedCount,
+        conditionRejectedCount: active.conditionRejectedCount,
+        truncated: active.truncated,
+      },
+    ])
+
+    revalidatePath('/tracker')
+    revalidatePath('/opportunities')
+    revalidatePath('/research')
+    revalidatePath(`/inventory/${encodeURIComponent(part.mpn)}`)
+
+    return { ok: true, capturedAt: new Date().toISOString() }
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : 'Could not capture active eBay research.',
+    }
+  }
+}
 
 const researchNumber = z
   .string()

@@ -5,12 +5,14 @@ import { useRouter } from 'next/navigation'
 import { useEffect, useMemo, useState } from 'react'
 
 import {
+  captureActiveResearch,
   saveResearch,
   type ResearchWindowFormInput,
 } from '@/app/(app)/tracker/actions'
 import { Chip, EmptyState } from '@/components/ui'
+import { money, relativeTime } from '@/lib/format'
 import { buildEbayActiveResearchUrl, buildEbaySoldResearchUrl } from '@/lib/ebay/research-links'
-import { PERIODS, PERIOD_LABELS, type Period, type PeriodObservation } from '@/lib/types'
+import { PERIODS, PERIOD_LABELS, type ActiveMarketObservation, type Period, type PeriodObservation } from '@/lib/types'
 
 export type ResearchTrackerRow = {
   partId: number
@@ -19,6 +21,7 @@ export type ResearchTrackerRow = {
   inventoryQty: number
   lastResearchedAt: string | null
   periods: Partial<Record<Period, PeriodObservation>>
+  activeMarket: ActiveMarketObservation | null
 }
 
 type Field =
@@ -71,6 +74,8 @@ export function ResearchTracker({ rows }: { rows: ResearchTrackerRow[] }) {
   const [open, setOpen] = useState<number | null>(rows.length === 1 ? rows[0]!.partId : null)
   const [drafts, setDrafts] = useState<Drafts>({})
   const [saving, setSaving] = useState<number | null>(null)
+  const [capturingActive, setCapturingActive] = useState<number | null>(null)
+  const [activeCaptured, setActiveCaptured] = useState<number | null>(null)
   const [saved, setSaved] = useState<number | null>(null)
   const [errors, setErrors] = useState<Record<number, string>>({})
 
@@ -106,6 +111,28 @@ export function ResearchTracker({ rows }: { rows: ResearchTrackerRow[] }) {
       },
     }))
     setSaved((current) => (current === row.partId ? null : current))
+  }
+
+
+  async function captureActive(row: ResearchTrackerRow) {
+    setCapturingActive(row.partId)
+    setActiveCaptured((current) => (current === row.partId ? null : current))
+    setErrors((current) => {
+      const next = { ...current }
+      delete next[row.partId]
+      return next
+    })
+
+    const result = await captureActiveResearch({ partId: row.partId, mpn: row.mpn })
+    setCapturingActive(null)
+
+    if (!result.ok) {
+      setErrors((current) => ({ ...current, [row.partId]: result.error }))
+      return
+    }
+
+    setActiveCaptured(row.partId)
+    router.refresh()
   }
 
   async function commit(row: ResearchTrackerRow) {
@@ -234,6 +261,14 @@ export function ResearchTracker({ rows }: { rows: ResearchTrackerRow[] }) {
                           >
                             Active eBay ↗
                           </a>
+                          <button
+                            type="button"
+                            onClick={() => void captureActive(row)}
+                            disabled={capturingActive === row.partId || saving === row.partId}
+                            className="border-good/40 bg-good/10 text-good hover:bg-good/20 rounded border px-3 py-1.5 font-mono text-xs disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            {capturingActive === row.partId ? 'Capturing Active…' : 'Capture Active'}
+                          </button>
                           <a
                             href={buildEbaySoldResearchUrl(row.mpn)}
                             target="_blank"
@@ -251,9 +286,62 @@ export function ResearchTracker({ rows }: { rows: ResearchTrackerRow[] }) {
                       <div className="border-line bg-surface mb-3 rounded border px-3 py-2">
                         <p className="text-ink-dim text-xs">
                           Both eBay searches use exactly <strong className="text-ink font-mono">{row.mpn}</strong> as
-                          the keyword. Read the Active and Sold results, enter the Product Research
-                          values below, then SAVE RESEARCH.
+                          the keyword. <strong className="text-ink">Capture Active</strong> appends one
+                          point-in-time Active snapshot from the same MPN-only research population.
+                          Sold-window research stays separate below.
                         </p>
+                      </div>
+
+                      <div className="border-line bg-surface mb-4 rounded border p-3">
+                        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                          <div>
+                            <h4 className="text-ink text-xs font-semibold tracking-wide uppercase">
+                              Active market snapshot
+                            </h4>
+                            <p className="text-ink-faint mt-0.5 text-[11px]">
+                              MPN-only eBay Browse capture. No brand/model/description/compatibility or condition filter.
+                            </p>
+                          </div>
+                          <div className="flex items-center gap-1.5">
+                            <Chip tone="info">MPN only</Chip>
+                            {activeCaptured === row.partId && <Chip tone="good">Captured ✓</Chip>}
+                            {row.activeMarket?.truncated && <Chip tone="warn">Count withheld · truncated</Chip>}
+                          </div>
+                        </div>
+
+                        {row.activeMarket ? (
+                          <>
+                            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+                              <div className="border-line rounded border px-2.5 py-2">
+                                <div className="text-ink-faint text-[10px] tracking-widest uppercase">Median Asking</div>
+                                <div className="text-ink mt-1 font-mono text-sm">{money(row.activeMarket.askingPrice)}</div>
+                              </div>
+                              <div className="border-line rounded border px-2.5 py-2">
+                                <div className="text-ink-faint text-[10px] tracking-widest uppercase">Median Shipping</div>
+                                <div className="text-ink mt-1 font-mono text-sm">{money(row.activeMarket.askingShipping)}</div>
+                              </div>
+                              <div className="border-line rounded border px-2.5 py-2">
+                                <div className="text-ink-faint text-[10px] tracking-widest uppercase">Active Listings</div>
+                                <div className="text-ink mt-1 font-mono text-sm">{row.activeMarket.activeQty ?? '—'}</div>
+                              </div>
+                              <div className="border-line rounded border px-2.5 py-2">
+                                <div className="text-ink-faint text-[10px] tracking-widest uppercase">Exact-MPN Sample</div>
+                                <div className="text-ink mt-1 font-mono text-sm">{row.activeMarket.sampleSize ?? '—'}</div>
+                              </div>
+                            </div>
+                            <div className="text-ink-faint mt-2 flex flex-wrap gap-x-4 gap-y-1 font-mono text-[10px]">
+                              <span>Captured {relativeTime(row.activeMarket.capturedAt)}</span>
+                              {row.activeMarket.broadMatchCount != null && <span>Broad results {row.activeMarket.broadMatchCount}</span>}
+                              {row.activeMarket.mpnRejectedCount != null && row.activeMarket.mpnRejectedCount > 0 && (
+                                <span>{row.activeMarket.mpnRejectedCount} non-MPN results rejected</span>
+                              )}
+                            </div>
+                          </>
+                        ) : (
+                          <p className="text-ink-dim py-3 text-center text-xs">
+                            No Active snapshot saved yet. Use Capture Active when you want a dated supply observation.
+                          </p>
+                        )}
                       </div>
 
                       <div className="overflow-x-auto">
@@ -344,7 +432,7 @@ export function ResearchTracker({ rows }: { rows: ResearchTrackerRow[] }) {
                         <button
                           type="button"
                           onClick={() => void commit(row)}
-                          disabled={saving === row.partId}
+                          disabled={saving === row.partId || capturingActive === row.partId}
                           className="bg-good rounded px-4 py-2 font-mono text-xs font-semibold text-black disabled:cursor-not-allowed disabled:opacity-50"
                         >
                           {saving === row.partId ? 'Saving research…' : 'SAVE RESEARCH'}

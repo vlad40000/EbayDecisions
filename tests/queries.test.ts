@@ -392,6 +392,29 @@ describe('Sold Research tracker query', () => {
     expect(result.rows[0]?.lastResearchedAt).toBe('2026-09-30T12:00:00.000Z')
   })
 
+  it('returns the latest Active snapshot separately from sold-window research', async () => {
+    const part = await createPart({ mpn: 'TRACK-ACTIVE', description: 'Board', inventoryQty: 1 })
+    await insertActiveSnapshots([
+      {
+        partId: part.id,
+        askingPrice: 88,
+        askingShipping: 14,
+        activeQty: 6,
+        sampleSize: 6,
+        broadMatchCount: 9,
+        mpnRejectedCount: 3,
+        conditionRejectedCount: 0,
+        truncated: false,
+      },
+    ])
+
+    const result = await listTrackerResearchParts({ mpns: ['TRACK-ACTIVE'] })
+    expect(result.rows[0]?.activeMarket?.askingPrice).toBe(88)
+    expect(result.rows[0]?.activeMarket?.askingShipping).toBe(14)
+    expect(result.rows[0]?.activeMarket?.activeQty).toBe(6)
+    expect(result.rows[0]?.activeMarket?.mpnRejectedCount).toBe(3)
+  })
+
   it('paginates and accepts an explicit queue working set', async () => {
     await createPart({ mpn: 'TRACK-A', description: 'A', inventoryQty: 1 })
     await createPart({ mpn: 'TRACK-B', description: 'B', inventoryQty: 1 })
