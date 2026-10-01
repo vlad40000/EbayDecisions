@@ -21,6 +21,7 @@ import { PERIOD_DAYS, PERIOD_LABELS, type MarketResearchSession, type Period } f
 export const dynamic = 'force-dynamic'
 
 const TABLE_PERIODS: Period[] = ['1yr', '6m', '90d', '30d', '7d']
+const CHART_PERIODS: Period[] = ['7d', '30d', '90d', '6m', '1yr']
 
 export async function generateMetadata(props: { params: Promise<{ mpn: string }> }) {
   const { mpn } = await props.params
@@ -72,7 +73,7 @@ export default async function PartDetailPage(props: { params: Promise<{ mpn: str
     trendSub = `${delta >= 0 ? '+' : ''}${money(delta)} vs 1yr`
   }
 
-  const chartData: PeriodPoint[] = TABLE_PERIODS.map((period) => {
+  const chartData: PeriodPoint[] = CHART_PERIODS.map((period) => {
     const observation = periods[period]
     return {
       period: PERIOD_LABELS[period],
