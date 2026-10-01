@@ -3,6 +3,14 @@
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 
+const MORE_LINKS = [
+  ['/tracker?advanced=1', 'Advanced Research'],
+  ['/opportunities', 'Market Opportunities'],
+  ['/research', 'Research Queue'],
+  ['/inventory', 'Inventory'],
+  ['/settings', 'Settings'],
+] as const
+
 export function Nav() {
   const pathname = usePathname()
   const trackerActive = pathname === '/tracker' || pathname === '/'
@@ -44,13 +52,7 @@ export function Nav() {
               More ▾
             </summary>
             <div className="border-line bg-surface absolute top-full left-0 z-50 mt-1 w-52 rounded border p-1 shadow-xl">
-              {[
-                ['/tracker?advanced=1', 'Advanced Research'],
-                ['/opportunities', 'Market Opportunities'],
-                ['/research', 'Research Queue'],
-                ['/inventory', 'Inventory'],
-                ['/settings', 'Settings'],
-              ].map(([href, label]) => (
+              {MORE_LINKS.map(([href, label]) => (
                 <Link key={href} href={href} className="text-ink-dim hover:bg-white/[0.04] hover:text-ink block rounded px-3 py-2 text-xs">
                   {label}
                 </Link>
