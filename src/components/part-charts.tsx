@@ -122,7 +122,7 @@ function normalizePeriodData(data: PeriodPoint[]) {
 }
 
 export function DeliveredCostChart({ data }: { data: PeriodPoint[] }) {
-  const ordered = [...normalizePeriodData(data)].sort((a, b) => b.daysAgo - a.daysAgo)
+  const ordered = [...normalizePeriodData(data)].sort((a, b) => a.daysAgo - b.daysAgo)
 
   return (
     <ResponsiveContainer width="100%" height={230}>
