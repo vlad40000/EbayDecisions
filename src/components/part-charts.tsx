@@ -121,6 +121,37 @@ function normalizePeriodData(data: PeriodPoint[]) {
   })
 }
 
+export function DeliveredCostChart({ data }: { data: PeriodPoint[] }) {
+  const ordered = [...normalizePeriodData(data)].sort((a, b) => b.daysAgo - a.daysAgo)
+
+  return (
+    <ResponsiveContainer width="100%" height={230}>
+      <LineChart data={ordered} margin={{ top: 8, right: 24, left: -12, bottom: 0 }}>
+        <CartesianGrid stroke={GRID} strokeWidth={1} vertical={false} />
+        <XAxis dataKey="period" tick={axisTick} axisLine={false} tickLine={false} />
+        <YAxis
+          tick={axisTick}
+          axisLine={false}
+          tickLine={false}
+          tickFormatter={(value: number) => `${value}`}
+          width={52}
+          domain={FITTED_DOMAIN}
+        />
+        <Tooltip content={<ChartTooltip moneyKeys={['delivered']} />} cursor={{ stroke: GRID, strokeWidth: 1 }} />
+        <Line
+          type="monotone"
+          dataKey="delivered"
+          name="Total cost"
+          stroke={SERIES.price}
+          strokeWidth={2}
+          dot={{ r: 3 }}
+          connectNulls={false}
+        />
+      </LineChart>
+    </ResponsiveContainer>
+  )
+}
+
 export function AverageSoldPriceChart({ data }: { data: PeriodPoint[] }) {
   const ordered = [...normalizePeriodData(data)].sort((a, b) => b.daysAgo - a.daysAgo)
 
