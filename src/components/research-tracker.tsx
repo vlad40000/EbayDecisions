@@ -6,10 +6,10 @@ import { useEffect, useMemo, useState } from 'react'
 
 import {
   saveResearch,
-  type ResearchSaveSource,
   type ResearchWindowFormInput,
 } from '@/app/(app)/tracker/actions'
 import { Chip, EmptyState } from '@/components/ui'
+import { buildEbayActiveResearchUrl, buildEbaySoldResearchUrl } from '@/lib/ebay/research-links'
 import { PERIODS, PERIOD_LABELS, type Period, type PeriodObservation } from '@/lib/types'
 
 export type ResearchTrackerRow = {
@@ -32,26 +32,6 @@ type Field =
   | 'freeShippingPct'
 
 type Drafts = Record<number, Partial<Record<Period, Partial<Record<Field, string>>>>>
-
-type AssistedWindow = {
-  avgSoldPrice: number | null
-  avgShipping: number | null
-  totalSold: number | null
-  soldPriceMin: number | null
-  soldPriceMax: number | null
-  freeShippingPct: number | null
-  sampleSize: number
-}
-
-type EbaySoldPreview = {
-  source: 'ebay_marketplace_insights'
-  windows: Partial<Record<'90d' | '30d' | '7d', AssistedWindow>>
-  exactMpnVerified: boolean
-  mpnRejectedCount: number
-  truncated: boolean
-}
-
-const ASSISTED_PERIODS = ['7d', '30d', '90d'] as const
 
 function initialValue(observation: PeriodObservation | undefined, field: Field): string {
   const value = {
@@ -91,10 +71,8 @@ export function ResearchTracker({ rows }: { rows: ResearchTrackerRow[] }) {
   const [open, setOpen] = useState<number | null>(rows.length === 1 ? rows[0]!.partId : null)
   const [drafts, setDrafts] = useState<Drafts>({})
   const [saving, setSaving] = useState<number | null>(null)
-  const [fetching, setFetching] = useState<number | null>(null)
   const [saved, setSaved] = useState<number | null>(null)
   const [errors, setErrors] = useState<Record<number, string>>({})
-  const [previews, setPreviews] = useState<Record<number, EbaySoldPreview>>({})
 
   const dirtyCount = useMemo(
     () =>
@@ -130,57 +108,6 @@ export function ResearchTracker({ rows }: { rows: ResearchTrackerRow[] }) {
     setSaved((current) => (current === row.partId ? null : current))
   }
 
-  async function fetchEbaySold(row: ResearchTrackerRow) {
-    setFetching(row.partId)
-    setErrors((current) => {
-      const next = { ...current }
-      delete next[row.partId]
-      return next
-    })
-
-    try {
-      const response = await fetch(`/api/ebay/research/${encodeURIComponent(row.mpn)}`, {
-        cache: 'no-store',
-      })
-      const body = (await response.json()) as EbaySoldPreview | { error?: string }
-
-      if (!response.ok || !('windows' in body)) {
-        throw new Error('error' in body && body.error ? body.error : 'Could not fetch eBay SOLD research.')
-      }
-
-      setDrafts((current) => {
-        const partDraft = { ...(current[row.partId] ?? {}) }
-
-        for (const period of ASSISTED_PERIODS) {
-          const window = body.windows[period]
-          if (!window) continue
-
-          partDraft[period] = {
-            ...(partDraft[period] ?? {}),
-            avgSoldPrice: decimalDraft(window.avgSoldPrice),
-            avgShipping: decimalDraft(window.avgShipping),
-            totalSold: integerDraft(window.totalSold),
-            soldPriceMin: decimalDraft(window.soldPriceMin),
-            soldPriceMax: decimalDraft(window.soldPriceMax),
-            freeShippingPct: decimalDraft(window.freeShippingPct),
-          }
-        }
-
-        return { ...current, [row.partId]: partDraft }
-      })
-
-      setPreviews((current) => ({ ...current, [row.partId]: body }))
-      setSaved((current) => (current === row.partId ? null : current))
-    } catch (error) {
-      setErrors((current) => ({
-        ...current,
-        [row.partId]: error instanceof Error ? error.message : 'Could not fetch eBay SOLD research.',
-      }))
-    } finally {
-      setFetching(null)
-    }
-  }
-
   async function commit(row: ResearchTrackerRow) {
     const windows: ResearchWindowFormInput[] = PERIODS.map((period) => ({
       period,
@@ -194,10 +121,6 @@ export function ResearchTracker({ rows }: { rows: ResearchTrackerRow[] }) {
       freeShippingPct: value(row, period, 'freeShippingPct'),
     }))
 
-    const source: ResearchSaveSource = previews[row.partId]
-      ? 'ebay_insights_reviewed'
-      : 'ebay_product_research_manual'
-
     setSaving(row.partId)
     setErrors((current) => {
       const next = { ...current }
@@ -205,7 +128,7 @@ export function ResearchTracker({ rows }: { rows: ResearchTrackerRow[] }) {
       return next
     })
 
-    const result = await saveResearch({ partId: row.partId, source, windows })
+    const result = await saveResearch({ partId: row.partId, windows })
     setSaving(null)
 
     if (!result.ok) {
@@ -214,11 +137,6 @@ export function ResearchTracker({ rows }: { rows: ResearchTrackerRow[] }) {
     }
 
     setDrafts((current) => {
-      const next = { ...current }
-      delete next[row.partId]
-      return next
-    })
-    setPreviews((current) => {
       const next = { ...current }
       delete next[row.partId]
       return next
@@ -268,8 +186,6 @@ export function ResearchTracker({ rows }: { rows: ResearchTrackerRow[] }) {
 
             {rows.map((row) => {
               const isOpen = open === row.partId
-              const preview = previews[row.partId]
-
               return (
                 <div key={row.partId} className="border-line border-b last:border-0">
                   <button
@@ -304,45 +220,41 @@ export function ResearchTracker({ rows }: { rows: ResearchTrackerRow[] }) {
                             eBay Product Research — {row.mpn}
                           </h3>
                           <p className="text-ink-faint mt-0.5 max-w-2xl text-xs">
-                            Enter all five windows manually, or fetch recent eBay SOLD data into the
-                            7d/30d/90d draft fields when Marketplace Insights access is available.
-                            Fetching never writes to Neon.
+                            Research eBay using this MPN only. Brand, model, description, category,
+                            compatibility, and machine context are never appended to the search.
                           </p>
                         </div>
 
-                        <div className="flex items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => void fetchEbaySold(row)}
-                            disabled={fetching === row.partId || saving === row.partId}
-                            className="border-info/40 bg-info/10 text-info hover:bg-info/20 rounded border px-3 py-1.5 font-mono text-xs disabled:cursor-not-allowed disabled:opacity-50"
+                        <div className="flex flex-wrap items-center gap-2">
+                          <a
+                            href={buildEbayActiveResearchUrl(row.mpn)}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="border-line bg-surface text-ink-dim hover:text-ink rounded border px-3 py-1.5 font-mono text-xs transition-colors"
                           >
-                            {fetching === row.partId ? 'Fetching SOLD…' : 'Fetch eBay SOLD'}
-                          </button>
+                            Active eBay ↗
+                          </a>
+                          <a
+                            href={buildEbaySoldResearchUrl(row.mpn)}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="border-info/40 bg-info/10 text-info hover:bg-info/20 rounded border px-3 py-1.5 font-mono text-xs transition-colors"
+                          >
+                            Sold eBay ↗
+                          </a>
                           <Chip tone={row.lastResearchedAt ? 'info' : 'dim'}>
                             {lastResearchedLabel(row.lastResearchedAt)}
                           </Chip>
                         </div>
                       </div>
 
-                      {preview && (
-                        <div className="border-line bg-surface mb-3 rounded border px-3 py-2">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <Chip tone="info">Insights preview</Chip>
-                            <Chip tone={preview.exactMpnVerified ? 'good' : 'warn'}>
-                              {preview.exactMpnVerified ? 'MPN titles verified' : 'MPN qualification unverified'}
-                            </Chip>
-                            {preview.mpnRejectedCount > 0 && (
-                              <Chip tone="dim">{preview.mpnRejectedCount} wrong-MPN rejected</Chip>
-                            )}
-                            {preview.truncated && <Chip tone="warn">Result truncated · sold counts withheld</Chip>}
-                          </div>
-                          <p className="text-ink-faint mt-2 text-xs">
-                            7d, 30d and 90d draft fields were refreshed from eBay. Review them, then
-                            update 6m and 1yr manually before SAVE RESEARCH.
-                          </p>
-                        </div>
-                      )}
+                      <div className="border-line bg-surface mb-3 rounded border px-3 py-2">
+                        <p className="text-ink-dim text-xs">
+                          Both eBay searches use exactly <strong className="text-ink font-mono">{row.mpn}</strong> as
+                          the keyword. Read the Active and Sold results, enter the Product Research
+                          values below, then SAVE RESEARCH.
+                        </p>
+                      </div>
 
                       <div className="overflow-x-auto">
                         <table className="w-full border-collapse text-xs" style={{ minWidth: 1000 }}>
@@ -432,7 +344,7 @@ export function ResearchTracker({ rows }: { rows: ResearchTrackerRow[] }) {
                         <button
                           type="button"
                           onClick={() => void commit(row)}
-                          disabled={saving === row.partId || fetching === row.partId}
+                          disabled={saving === row.partId}
                           className="bg-good rounded px-4 py-2 font-mono text-xs font-semibold text-black disabled:cursor-not-allowed disabled:opacity-50"
                         >
                           {saving === row.partId ? 'Saving research…' : 'SAVE RESEARCH'}

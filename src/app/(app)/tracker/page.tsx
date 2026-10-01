@@ -64,14 +64,14 @@ export default async function TrackerPage(props: { searchParams: PageSearchParam
     <div>
       <PageHeader
         title="Market Tracker"
-        subtitle="Manual or assisted eBay Product Research. The five period quantities are total SOLD, not active listings."
+        subtitle="eBay Active and Sold research by MPN only. The five period quantities are total SOLD, not active listings."
       />
 
       <div className="mb-4">
         <Notice tone="info">
-          Use <strong>Fetch eBay SOLD</strong> for a review-only 7d/30d/90d preview when Marketplace
-          Insights access is available. Preview values stay local until <strong>SAVE RESEARCH</strong>;
-          6m and 1yr remain manual. No autosave, polling, or automatic catalogue sweep runs here.
+          Open <strong>Active eBay</strong> and <strong>Sold eBay</strong> from an MPN row. Both links
+          search eBay using only the supplied MPN—no brand, model, description, category, compatibility,
+          or machine terms are added. Enter the research values, then <strong>SAVE RESEARCH</strong>.
         </Notice>
       </div>
 
