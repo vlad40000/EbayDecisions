@@ -11,7 +11,11 @@ import {
 } from '@/app/(app)/tracker/actions'
 import { Chip, EmptyState } from '@/components/ui'
 import { money, relativeTime } from '@/lib/format'
-import { buildEbayActiveResearchUrl, buildEbaySoldResearchUrl } from '@/lib/ebay/research-links'
+import {
+  buildEbayActiveResearchUrl,
+  buildEbayProductResearchUrl,
+  buildEbaySoldResearchUrl,
+} from '@/lib/ebay/research-links'
 import { PERIODS, PERIOD_LABELS, type ActiveMarketObservation, type Period, type PeriodObservation } from '@/lib/types'
 
 export type ResearchTrackerRow = {
@@ -69,7 +73,7 @@ function integerDraft(value: number | null): string {
   return value == null ? '' : String(Math.round(value))
 }
 
-export function ResearchTracker({ rows }: { rows: ResearchTrackerRow[] }) {
+export function ResearchTracker({ rows, researchNowMs }: { rows: ResearchTrackerRow[]; researchNowMs: number }) {
   const router = useRouter()
   const [open, setOpen] = useState<number | null>(rows.length === 1 ? rows[0]!.partId : null)
   const [drafts, setDrafts] = useState<Drafts>({})
@@ -344,6 +348,10 @@ export function ResearchTracker({ rows }: { rows: ResearchTrackerRow[] }) {
                         )}
                       </div>
 
+                      <p className="text-ink-faint mb-2 text-[11px]">
+                        Click a period name to open Seller Hub Product Research preloaded with only this MPN and that date window.
+                      </p>
+
                       <div className="overflow-x-auto">
                         <table className="w-full border-collapse text-xs" style={{ minWidth: 1000 }}>
                           <thead>
@@ -385,8 +393,16 @@ export function ResearchTracker({ rows }: { rows: ResearchTrackerRow[] }) {
 
                               return (
                                 <tr key={period} className="border-line/50 border-b last:border-0">
-                                  <td className="text-ink-dim px-1.5 py-2 font-mono text-xs font-semibold">
-                                    {PERIOD_LABELS[period]}
+                                  <td className="px-1.5 py-2">
+                                    <a
+                                      href={buildEbayProductResearchUrl(row.mpn, period, researchNowMs)}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                      title={`Open eBay Product Research for ${row.mpn} · ${PERIOD_LABELS[period]}`}
+                                      className="text-info hover:text-good inline-flex items-center gap-1 font-mono text-xs font-semibold transition-colors"
+                                    >
+                                      {PERIOD_LABELS[period]} <span aria-hidden>↗</span>
+                                    </a>
                                   </td>
                                   {fields.map(({ key, integer, suffix }) => (
                                     <td key={key} className="px-1.5 py-1.5">
