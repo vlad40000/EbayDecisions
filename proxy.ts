@@ -40,9 +40,10 @@ export const config = {
   matcher: [
     /*
      * Everything except: the login page and its action, the cron endpoint
-     * (which authenticates with CRON_SECRET instead of a cookie), Next's own
-     * assets, and static files.
+     * (which authenticates with CRON_SECRET instead of a cookie), the
+     * service-to-service integration API (which authenticates with
+     * INTEGRATION_API_KEY), Next's own assets, and static files.
      */
-    '/((?!login|api/cron|_next/static|_next/image|favicon.ico|robots.txt|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico)$).*)',
+    '/((?!login|api/cron|api/integrations/|_next/static|_next/image|favicon.ico|robots.txt|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico)$).*)',
   ],
 }

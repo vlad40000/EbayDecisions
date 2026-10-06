@@ -34,7 +34,10 @@ export const parts = pgTable(
   'parts',
   {
     id: serial('id').primaryKey(),
+    /** Display spelling as entered or imported. */
     mpn: text('mpn').notNull(),
+    /** D1 identity key (`toMpnKey`). One part per key. */
+    mpnKey: text('mpn_key').notNull(),
     description: text('description').notNull(),
     category: text('category'),
     inventoryQty: integer('inventory_qty').notNull().default(0),
@@ -49,6 +52,8 @@ export const parts = pgTable(
   },
   (t) => [
     uniqueIndex('parts_mpn_unique').on(t.mpn),
+    uniqueIndex('parts_mpn_key_unique').on(t.mpnKey),
+    check('parts_mpn_key_nonblank', sql`${t.mpnKey} <> ''`),
     index('parts_active_idx').on(t.active),
     index('parts_description_idx').on(t.description),
     index('parts_category_idx').on(t.category),

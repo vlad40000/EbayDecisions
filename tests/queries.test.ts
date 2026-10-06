@@ -33,6 +33,7 @@ import {
   upsertPartByMpn,
 } from '@/db/queries'
 import { activeMarketSnapshots, marketResearchSessions, marketSnapshots } from '@/db/schema'
+import { toMpnKey } from '@/lib/mpn'
 
 const client = new PGlite()
 const testDb = drizzle({ client, schema })
@@ -189,6 +190,7 @@ describe('Inventory pagination', () => {
     await testDb.insert(schema.parts).values(
       Array.from({ length: 61 }, (_, index) => ({
         mpn: `INV-${String(index + 1).padStart(3, '0')}`,
+        mpnKey: toMpnKey(`INV-${String(index + 1).padStart(3, '0')}`),
         description: index === 40 ? 'Special Control Board' : 'Generic Part',
         inventoryQty: index % 3,
       })),
@@ -219,6 +221,7 @@ describe('Market Opportunities query', () => {
     await testDb.insert(schema.parts).values(
       Array.from({ length: 55 }, (_, index) => ({
         mpn: `PART-${String(index + 1).padStart(3, '0')}`,
+        mpnKey: toMpnKey(`PART-${String(index + 1).padStart(3, '0')}`),
         description: 'Control Board',
         inventoryQty: 1,
       })),
@@ -239,8 +242,8 @@ describe('Market Opportunities query', () => {
 
   it('searches exact MPNs at the database layer', async () => {
     await testDb.insert(schema.parts).values([
-      { mpn: 'W10830046', description: 'Refrigerator Door Gasket', inventoryQty: 1 },
-      { mpn: 'W10634026', description: 'Washer Control Board', inventoryQty: 1 },
+      { mpn: 'W10830046', mpnKey: 'W10830046', description: 'Refrigerator Door Gasket', inventoryQty: 1 },
+      { mpn: 'W10634026', mpnKey: 'W10634026', description: 'Washer Control Board', inventoryQty: 1 },
     ])
 
     const result = await listMarketOpportunities({ query: 'W10830046' })
