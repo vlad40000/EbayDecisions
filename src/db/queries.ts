@@ -5,6 +5,8 @@ import { alias } from 'drizzle-orm/pg-core'
 
 import { categoryOf } from '@/lib/categories'
 import { toDbNumeric, toNumber } from '@/lib/format'
+import type { MarketFactsV1 } from '@/lib/market-facts'
+import { toMpnKey } from '@/lib/mpn'
 import { timeTrend } from '@/lib/stats'
 import {
   PERIOD_DAYS,
@@ -34,7 +36,7 @@ import {
 
 // ─── Mapping ──────────────────────────────────────────────────────────────────
 
-function mapPart(row: typeof parts.$inferSelect): Part {
+function mapPart(row: Omit<typeof parts.$inferSelect, 'mpnKey'>): Part {
   return {
     id: row.id,
     mpn: row.mpn,
@@ -228,9 +230,19 @@ export async function listInventoryParts(
   }
 }
 
+/** Looks a part up by D1 key, so any case/punctuation spelling finds it. */
 export async function getPartByMpn(mpn: string): Promise<Part | null> {
-  const rows = await db.select().from(parts).where(eq(parts.mpn, mpn)).limit(1)
+  const key = toMpnKey(mpn)
+  if (!key) return null
+  const rows = await db.select().from(parts).where(eq(parts.mpnKey, key)).limit(1)
   return rows[0] ? mapPart(rows[0]) : null
+}
+
+/** D1 key for a submitted MPN; rejects spellings with no letters or digits. */
+function requireMpnKey(mpn: string): string {
+  const key = toMpnKey(mpn)
+  if (!key) throw new Error(`MPN "${mpn.trim()}" has no letters or digits.`)
+  return key
 }
 
 export type PartInput = {
@@ -251,6 +263,7 @@ export async function createPart(input: PartInput): Promise<Part> {
     .insert(parts)
     .values({
       mpn: input.mpn.trim(),
+      mpnKey: requireMpnKey(input.mpn),
       description: input.description.trim(),
       category: input.category ?? null,
       inventoryQty: input.inventoryQty ?? 0,
@@ -270,7 +283,7 @@ export async function updatePart(id: number, input: Partial<PartInput>): Promise
   await db
     .update(parts)
     .set({
-      ...(input.mpn !== undefined ? { mpn: input.mpn.trim() } : {}),
+      ...(input.mpn !== undefined ? { mpn: input.mpn.trim(), mpnKey: requireMpnKey(input.mpn) } : {}),
       ...(input.description !== undefined ? { description: input.description.trim() } : {}),
       ...(input.category !== undefined ? { category: input.category } : {}),
       ...(input.inventoryQty !== undefined ? { inventoryQty: input.inventoryQty } : {}),
@@ -291,14 +304,21 @@ export async function deletePart(id: number): Promise<void> {
   await db.delete(parts).where(eq(parts.id, id))
 }
 
+/**
+ * Identity is the D1 key: re-importing `dc47 00019a` updates the part stored
+ * as `DC47-00019A` instead of creating a second one. The stored display MPN
+ * is kept as-is; only the other supplied fields are updated.
+ */
 export async function upsertPartByMpn(input: PartInput): Promise<'inserted' | 'updated'> {
   const existing = await db
     .select({ id: parts.id })
     .from(parts)
-    .where(eq(parts.mpn, input.mpn.trim()))
+    .where(eq(parts.mpnKey, requireMpnKey(input.mpn)))
     .limit(1)
   if (existing[0]) {
-    await updatePart(existing[0].id, input)
+    const fields: Partial<PartInput> = { ...input }
+    delete fields.mpn
+    await updatePart(existing[0].id, fields)
     return 'updated'
   }
   await createPart(input)
@@ -673,7 +693,7 @@ export async function listTrackerResearchParts(
   const page = Math.max(1, Math.trunc(options.page ?? 1))
   const pageSize = Math.min(100, Math.max(1, Math.trunc(options.pageSize ?? 50)))
   const query = options.query?.trim() ?? ''
-  const selectedMpns = [...new Set((options.mpns ?? []).map((mpn) => mpn.trim()).filter(Boolean))].slice(0, 20)
+  const selectedKeys = [...new Set((options.mpns ?? []).map(toMpnKey).filter(Boolean))].slice(0, 20)
 
   const latestSession = db
     .selectDistinctOn([marketResearchSessions.partId], {
@@ -690,7 +710,7 @@ export async function listTrackerResearchParts(
     .as('tracker_latest_research_session')
 
   const conditions = [eq(parts.active, true)]
-  if (selectedMpns.length > 0) conditions.push(inArray(parts.mpn, selectedMpns))
+  if (selectedKeys.length > 0) conditions.push(inArray(parts.mpnKey, selectedKeys))
   if (query) {
     const search = or(ilike(parts.mpn, `%${query}%`), ilike(parts.description, `%${query}%`))
     if (search) conditions.push(search)
@@ -855,13 +875,13 @@ export async function listPartsWithMarket(
 }
 
 export async function listPartsWithMarketForMpns(mpns: string[]): Promise<PartWithMarket[]> {
-  const normalized = [...new Set(mpns.map((mpn) => mpn.trim()).filter(Boolean))].slice(0, 20)
-  if (normalized.length === 0) return []
+  const keys = [...new Set(mpns.map(toMpnKey).filter(Boolean))].slice(0, 20)
+  if (keys.length === 0) return []
 
   const partRows = await db
     .select()
     .from(parts)
-    .where(and(eq(parts.active, true), inArray(parts.mpn, normalized)))
+    .where(and(eq(parts.active, true), inArray(parts.mpnKey, keys)))
     .orderBy(parts.mpn)
 
   const mapped = partRows.map(mapPart)
@@ -902,6 +922,82 @@ export async function activeSnapshotHistory(partId: number, limit = 500): Promis
     .where(eq(activeMarketSnapshots.partId, partId))
     .orderBy(desc(activeMarketSnapshots.capturedAt), desc(activeMarketSnapshots.id))
     .limit(limit)
+}
+
+// ─── Integration market facts (read-only) ─────────────────────────────────────
+
+/**
+ * Market facts for Parts Engine, one record per requested D1 key, in request
+ * order. Reads only: exact-key lookups on `parts_mpn_key_unique`, then the
+ * newest 90d sold row and newest active row for just those parts. Nothing is
+ * inserted, updated, or registered, and no catalogue-wide scan is made.
+ */
+export async function getMarketFactsByMpnKeys(keys: string[]): Promise<MarketFactsV1[]> {
+  if (keys.length === 0) return []
+
+  const partRows = await db
+    .select({ id: parts.id, mpn: parts.mpn, mpnKey: parts.mpnKey })
+    .from(parts)
+    .where(inArray(parts.mpnKey, keys))
+  const ids = partRows.map((row) => row.id)
+
+  const [soldRows, active] = await Promise.all([
+    ids.length === 0
+      ? Promise.resolve([])
+      : db
+          .selectDistinctOn([marketSnapshots.partId], {
+            partId: marketSnapshots.partId,
+            price: marketSnapshots.price,
+            shipping: marketSnapshots.shipping,
+            soldQty: marketSnapshots.soldQty,
+            sellThroughPct: marketSnapshots.sellThroughPct,
+            source: marketSnapshots.source,
+            priceBasis: marketSnapshots.priceBasis,
+            capturedAt: marketSnapshots.capturedAt,
+          })
+          .from(marketSnapshots)
+          .where(and(inArray(marketSnapshots.partId, ids), eq(marketSnapshots.period, '90d')))
+          .orderBy(marketSnapshots.partId, desc(marketSnapshots.capturedAt), desc(marketSnapshots.id)),
+    latestActiveSnapshots(ids),
+  ])
+
+  const partByKey = new Map(partRows.map((row) => [row.mpnKey, row]))
+  const soldByPart = new Map(soldRows.map((row) => [row.partId, row]))
+
+  return keys.map((mpnKey): MarketFactsV1 => {
+    const part = partByKey.get(mpnKey)
+    if (!part) return { mpnKey, mpnDisplay: null, status: 'unregistered', sold90: null, active: null }
+
+    const sold = soldByPart.get(part.id)
+    const current = active.get(part.id)
+    return {
+      mpnKey,
+      mpnDisplay: part.mpn,
+      status: 'found',
+      sold90: sold
+        ? {
+            soldQty: sold.soldQty,
+            avgSoldPrice: toNumber(sold.price),
+            avgBuyerShipping: toNumber(sold.shipping),
+            sellThroughPct: toNumber(sold.sellThroughPct),
+            source: sold.source,
+            priceBasis: sold.priceBasis,
+            capturedAt: sold.capturedAt.toISOString(),
+          }
+        : null,
+      active: current
+        ? {
+            activeQty: current.activeQty,
+            askingPrice: current.askingPrice,
+            askingShipping: current.askingShipping,
+            source: current.source,
+            sampleSize: current.sampleSize,
+            truncated: current.truncated,
+            capturedAt: current.capturedAt,
+          }
+        : null,
+    }
+  })
 }
 
 // ─── Product Research sessions ────────────────────────────────────────────────
