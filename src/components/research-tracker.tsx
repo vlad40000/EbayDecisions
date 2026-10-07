@@ -65,7 +65,18 @@ function lastResearchedLabel(iso: string | null): string {
   return `${days} days ago`
 }
 
-export function ResearchTracker({ rows }: { rows: ResearchTrackerRow[] }) {
+/**
+ * `captureActiveEnabled` mirrors EBAY_AUTOMATED_RESEARCH_ENABLED, read on the
+ * server. When it is false (manual-only mode) Capture Active is hidden; the
+ * MPN-only eBay links and SAVE RESEARCH are unaffected.
+ */
+export function ResearchTracker({
+  rows,
+  captureActiveEnabled,
+}: {
+  rows: ResearchTrackerRow[]
+  captureActiveEnabled: boolean
+}) {
   const router = useRouter()
   const [open, setOpen] = useState<number | null>(rows.length === 1 ? rows[0]!.partId : null)
   const [drafts, setDrafts] = useState<Drafts>({})
@@ -257,14 +268,20 @@ export function ResearchTracker({ rows }: { rows: ResearchTrackerRow[] }) {
                           >
                             Active eBay ↗
                           </a>
-                          <button
-                            type="button"
-                            onClick={() => void captureActive(row)}
-                            disabled={capturingActive === row.partId || saving === row.partId}
-                            className="border-good/40 bg-good/10 text-good hover:bg-good/20 rounded border px-3 py-1.5 font-mono text-xs disabled:cursor-not-allowed disabled:opacity-50"
-                          >
-                            {capturingActive === row.partId ? 'Capturing Active…' : 'Capture Active'}
-                          </button>
+                          {captureActiveEnabled ? (
+                            <button
+                              type="button"
+                              onClick={() => void captureActive(row)}
+                              disabled={capturingActive === row.partId || saving === row.partId}
+                              className="border-good/40 bg-good/10 text-good hover:bg-good/20 rounded border px-3 py-1.5 font-mono text-xs disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              {capturingActive === row.partId ? 'Capturing Active…' : 'Capture Active'}
+                            </button>
+                          ) : (
+                            <Chip title="Automated eBay research is disabled, so Capture Active is off.">
+                              Manual-only
+                            </Chip>
+                          )}
                           <a
                             href={buildEbaySoldResearchUrl(row.mpn)}
                             target="_blank"
@@ -282,9 +299,20 @@ export function ResearchTracker({ rows }: { rows: ResearchTrackerRow[] }) {
                       <div className="border-line bg-surface mb-3 rounded border px-3 py-2">
                         <p className="text-ink-dim text-xs">
                           Both eBay searches use exactly <strong className="text-ink font-mono">{row.mpn}</strong> as
-                          the keyword. <strong className="text-ink">Capture Active</strong> appends one
-                          point-in-time Active snapshot from the same MPN-only research population.
-                          Sold-window research stays separate below.
+                          the keyword.{' '}
+                          {captureActiveEnabled ? (
+                            <>
+                              <strong className="text-ink">Capture Active</strong> appends one
+                              point-in-time Active snapshot from the same MPN-only research population.
+                              Sold-window research stays separate below.
+                            </>
+                          ) : (
+                            <>
+                              Automated eBay research is off (manual-only mode), so Capture Active is
+                              unavailable. Review eBay with the links above and record the Sold windows
+                              below with SAVE RESEARCH.
+                            </>
+                          )}
                         </p>
                       </div>
 
@@ -335,7 +363,9 @@ export function ResearchTracker({ rows }: { rows: ResearchTrackerRow[] }) {
                           </>
                         ) : (
                           <p className="text-ink-dim py-3 text-center text-xs">
-                            No Active snapshot saved yet. Use Capture Active when you want a dated supply observation.
+                            {captureActiveEnabled
+                              ? 'No Active snapshot saved yet. Use Capture Active when you want a dated supply observation.'
+                              : 'No Active snapshot saved yet. Capture Active is off in manual-only mode.'}
                           </p>
                         )}
                       </div>

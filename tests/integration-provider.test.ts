@@ -47,11 +47,15 @@ beforeEach(async () => {
   process.env.INTEGRATION_API_KEY = KEY
   process.env.EBAY_CLIENT_ID = 'ebay-client-id'
   process.env.EBAY_CLIENT_SECRET = EBAY_SECRET
+  // These suites exercise the eBay adapters, which run only with automated
+  // research on. Manual-only mode is covered in manual-only-ebay-gate.test.ts.
+  process.env.EBAY_AUTOMATED_RESEARCH_ENABLED = 'true'
 })
 afterEach(() => {
   delete process.env.INTEGRATION_API_KEY
   delete process.env.EBAY_CLIENT_ID
   delete process.env.EBAY_CLIENT_SECRET
+  delete process.env.EBAY_AUTOMATED_RESEARCH_ENABLED
   vi.restoreAllMocks()
 })
 afterAll(async () => client.close())

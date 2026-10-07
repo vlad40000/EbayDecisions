@@ -11,6 +11,7 @@ import {
 } from '@/db/queries'
 
 import type { Period } from '../types'
+import { AUTOMATED_EBAY_RESEARCH_DISABLED, isAutomatedEbayResearchEnabled } from './automation-gate'
 import { fetchActiveMarket } from './browse'
 import { EbayError, getEbayConfig, isEbayConfigured, type EbayAdapterName } from './client'
 import { fetchSoldWindows, type SoldWindowsResult } from './insights'
@@ -65,6 +66,12 @@ export async function runSync(trigger: 'cron' | 'manual'): Promise<SyncResult> {
     soldSnapshotsWritten: 0,
     activeSnapshotsWritten: 0,
     failures: [],
+  }
+
+  // Manual-only mode: skip before reading parts, opening a sync run, or
+  // contacting eBay.
+  if (!isAutomatedEbayResearchEnabled()) {
+    return { ...empty, status: 'skipped', message: AUTOMATED_EBAY_RESEARCH_DISABLED }
   }
 
   if (!isEbayConfigured()) {

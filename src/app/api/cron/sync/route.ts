@@ -1,6 +1,7 @@
 import { timingSafeEqual } from 'node:crypto'
 import { NextResponse, type NextRequest } from 'next/server'
 
+import { AUTOMATED_EBAY_RESEARCH_DISABLED, isAutomatedEbayResearchEnabled } from '@/lib/ebay/automation-gate'
 import { runSync } from '@/lib/ebay/sync'
 
 export const maxDuration = 300
@@ -16,12 +17,17 @@ function tokenMatches(provided: string, expected: string): boolean {
 }
 
 /**
- * Scheduled sync is opt-in. Vercel may still invoke this route from vercel.json,
- * but with EBAY_CRON_ENABLED unset/false it returns before touching Neon.
+ * Scheduled sync is opt-in twice over. Vercel may still invoke this route from
+ * vercel.json, but unless EBAY_CRON_ENABLED and EBAY_AUTOMATED_RESEARCH_ENABLED
+ * are both "true" it returns before touching Neon or eBay.
  */
 export async function GET(request: NextRequest) {
   if (process.env.EBAY_CRON_ENABLED !== 'true') {
     return NextResponse.json({ status: 'skipped', message: 'Scheduled eBay sync is disabled.' })
+  }
+
+  if (!isAutomatedEbayResearchEnabled()) {
+    return NextResponse.json({ status: 'skipped', message: AUTOMATED_EBAY_RESEARCH_DISABLED })
   }
 
   const expected = process.env.CRON_SECRET

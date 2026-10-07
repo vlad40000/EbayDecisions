@@ -5,9 +5,15 @@
  * enough for the read-only Buy APIs this app uses, with no user consent flow.
  * Tokens last about two hours and are cached in module scope, so a warm
  * serverless instance reuses one rather than minting a token per part.
+ *
+ * Nothing here contacts eBay unless automated research is enabled — see
+ * ./automation-gate. The check runs before the token cache, so even a token
+ * minted while the flag was on is never used once it is off.
  */
 
 import 'server-only'
+
+import { assertAutomatedEbayResearchEnabled } from './automation-gate'
 
 export type EbayAdapterName = 'browse' | 'insights'
 
@@ -80,6 +86,8 @@ const tokenCache = new Map<string, CachedToken>()
 const EXPIRY_SKEW_MS = 60_000
 
 export async function getAccessToken(scope: string, config = getEbayConfig()): Promise<string> {
+  assertAutomatedEbayResearchEnabled()
+
   const cached = tokenCache.get(scope)
   if (cached && cached.expiresAt > Date.now() + EXPIRY_SKEW_MS) return cached.token
 
@@ -131,6 +139,8 @@ export async function ebayGet<T>(
   scope: string,
   config = getEbayConfig(),
 ): Promise<T> {
+  assertAutomatedEbayResearchEnabled()
+
   const token = await getAccessToken(scope, config)
   const url = new URL(`${config.host}${path}`)
   for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value)
