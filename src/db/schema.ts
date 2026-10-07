@@ -44,6 +44,13 @@ export const parts = pgTable(
     costBasis: numeric('cost_basis', { precision: 10, scale: 2 }),
     shipCost: numeric('ship_cost', { precision: 10, scale: 2 }),
     targetMarginPct: numeric('target_margin_pct', { precision: 5, scale: 2 }),
+    /**
+     * Reference price of this part when new — the shared research CSV's
+     * `New Price`. Not cost basis, inventory, a sold comp, an asking price,
+     * shipping, or a margin target, and no decision math reads it. Null means
+     * unknown.
+     */
+    newPrice: numeric('new_price', { precision: 10, scale: 2 }),
     sourceUrl: text('source_url'),
     notes: text('notes'),
     active: boolean('active').notNull().default(true),
@@ -69,6 +76,10 @@ export const parts = pgTable(
     check(
       'parts_target_margin_sane',
       sql`${t.targetMarginPct} IS NULL OR (${t.targetMarginPct} >= 0 AND ${t.targetMarginPct} < 100)`,
+    ),
+    check(
+      'parts_new_price_sane',
+      sql`${t.newPrice} IS NULL OR (${t.newPrice} >= 0 AND ${t.newPrice} <= 1000000)`,
     ),
   ],
 )
