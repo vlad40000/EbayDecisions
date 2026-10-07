@@ -44,7 +44,13 @@ describe('browser session auth is unchanged', () => {
   })
 
   it('skips the session proxy only for login, cron, and the integration API', () => {
-    for (const url of ['/login', '/api/cron/sync', '/api/integrations/market-facts']) {
+    for (const url of [
+      '/login',
+      '/api/cron/sync',
+      '/api/integrations/market-facts',
+      '/api/integrations/parts/register',
+      '/api/integrations/research',
+    ]) {
       expect(unstable_doesMiddlewareMatch({ config, url }), url).toBe(false)
     }
   })

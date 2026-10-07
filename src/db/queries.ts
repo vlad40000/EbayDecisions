@@ -325,6 +325,63 @@ export async function upsertPartByMpn(input: PartInput): Promise<'inserted' | 'u
   return 'inserted'
 }
 
+export type PartIdentity = { id: number; mpn: string; mpnKey: string }
+
+/** Exact D1-key lookup for a bounded working set, in one indexed statement. */
+export async function findPartsByMpnKeys(keys: string[]): Promise<PartIdentity[]> {
+  if (keys.length === 0) return []
+  return db
+    .select({ id: parts.id, mpn: parts.mpn, mpnKey: parts.mpnKey })
+    .from(parts)
+    .where(inArray(parts.mpnKey, keys))
+}
+
+/**
+ * Insert-only registration for the integration API, one result per entry in
+ * entry order.
+ *
+ * New rows get the supplied display MPN and description, inventory 0, blank
+ * economics, and the normal active state. A key that already exists is
+ * reported as `existing` and its row is not touched — not its description,
+ * inventory, economics, notes, or active flag. One statement does the insert,
+ * so a concurrent registration of the same key also lands on `existing`.
+ */
+export async function registerPartsByMpnKey(
+  entries: { mpnKey: string; mpnDisplay: string; description: string }[],
+): Promise<{ mpnKey: string; mpnDisplay: string; status: 'inserted' | 'existing' }[]> {
+  if (entries.length === 0) return []
+
+  const inserted = await db
+    .insert(parts)
+    .values(
+      entries.map((entry) => ({
+        mpn: entry.mpnDisplay,
+        mpnKey: entry.mpnKey,
+        description: entry.description,
+        inventoryQty: 0,
+        active: true,
+      })),
+    )
+    .onConflictDoNothing()
+    .returning({ mpn: parts.mpn, mpnKey: parts.mpnKey })
+
+  const insertedKeys = new Set(inserted.map((row) => row.mpnKey))
+  const existing = await findPartsByMpnKeys(
+    entries.map((entry) => entry.mpnKey).filter((key) => !insertedKeys.has(key)),
+  )
+  const existingByKey = new Map(existing.map((row) => [row.mpnKey, row]))
+
+  return entries.map((entry) => {
+    if (insertedKeys.has(entry.mpnKey)) {
+      return { mpnKey: entry.mpnKey, mpnDisplay: entry.mpnDisplay, status: 'inserted' as const }
+    }
+    const row = existingByKey.get(entry.mpnKey)
+    // Only reachable if a stored mpn_key disagrees with its own display MPN.
+    if (!row) throw new Error(`Registration conflict for MPN key ${entry.mpnKey}.`)
+    return { mpnKey: entry.mpnKey, mpnDisplay: row.mpn, status: 'existing' as const }
+  })
+}
+
 // ─── Market opportunities ────────────────────────────────────────────────────
 
 export type MarketOpportunityResearchState = 'all' | 'never' | 'stale' | 'current'
