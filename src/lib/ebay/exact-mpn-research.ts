@@ -15,6 +15,7 @@ import {
   type TargetedResearchResultV1,
 } from '../targeted-research'
 import type { Period } from '../types'
+import { assertAutomatedEbayResearchEnabled } from './automation-gate'
 import { fetchActiveMarket, type BrowseResult } from './browse'
 import { EbayError, getAccessToken, getEbayConfig, type EbayConfig } from './client'
 import { fetchSoldWindows, type SoldWindowsResult } from './insights'
@@ -178,8 +179,13 @@ async function researchSold(
  * Researches each D1 key once, in request order. Keys with no registered part
  * come back `unregistered` and are never created. eBay is only contacted once
  * a registered part is reached.
+ *
+ * Throws AutomatedEbayResearchDisabledError before any lookup in manual-only
+ * mode; the route answers 503 before calling this.
  */
 export async function researchExactMpns(keys: string[]): Promise<TargetedResearchResultV1[]> {
+  assertAutomatedEbayResearchEnabled()
+
   const partByKey = new Map((await findPartsByMpnKeys(keys)).map((part) => [part.mpnKey, part]))
 
   let config: EbayConfig | null = null

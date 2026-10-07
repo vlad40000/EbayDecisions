@@ -4,6 +4,7 @@ import { QuickMarketGrid, type QuickTrackerRow } from '@/components/quick-market
 import { ResearchTracker, type ResearchTrackerRow } from '@/components/research-tracker'
 import { DatabaseError } from '@/components/ui'
 import { listTrackerResearchParts } from '@/db/queries'
+import { isAutomatedEbayResearchEnabled } from '@/lib/ebay/automation-gate'
 import { requireSession } from '@/lib/session'
 
 export const metadata = { title: 'Market Tracker — EbayDecisions' }
@@ -96,7 +97,10 @@ export default async function TrackerPage(props: { searchParams: PageSearchParam
           </div>
 
           {advanced ? (
-            <ResearchTracker rows={rows as ResearchTrackerRow[]} />
+            <ResearchTracker
+              rows={rows as ResearchTrackerRow[]}
+              captureActiveEnabled={isAutomatedEbayResearchEnabled()}
+            />
           ) : (
             <QuickMarketGrid rows={rows as QuickTrackerRow[]} />
           )}

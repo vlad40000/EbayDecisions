@@ -2,6 +2,7 @@ import { ImportExport } from '@/components/import-export'
 import { SettingsForm } from '@/components/settings-form'
 import { Chip, DatabaseError, Notice, PageHeader, Panel } from '@/components/ui'
 import { getSettings, recentSyncRuns } from '@/db/queries'
+import { isAutomatedEbayResearchEnabled } from '@/lib/ebay/automation-gate'
 import { getEbayConfig, isEbayConfigured } from '@/lib/ebay/client'
 import { relativeTime } from '@/lib/format'
 import { requireSession } from '@/lib/session'
@@ -32,6 +33,7 @@ export default async function SettingsPage() {
   }
 
   const ebayReady = isEbayConfigured()
+  const automatedResearch = isAutomatedEbayResearchEnabled()
   let ebayDetail: { env: string; marketplace: string; adapter: string; limit: number } | null = null
   if (ebayReady) {
     try {
@@ -63,6 +65,9 @@ export default async function SettingsPage() {
           <Chip tone={ebayReady ? 'good' : 'dim'}>
             {ebayReady ? 'Credentials set' : 'Not configured'}
           </Chip>
+          <Chip tone={automatedResearch ? 'warn' : 'info'}>
+            {automatedResearch ? 'Automated research on' : 'Manual-only'}
+          </Chip>
           {ebayDetail && (
             <>
               <Chip tone={ebayDetail.env === 'sandbox' ? 'warn' : 'dim'}>{ebayDetail.env}</Chip>
@@ -93,7 +98,8 @@ export default async function SettingsPage() {
           <p>
             <strong className="text-ink font-medium">Automation boundary.</strong> Any future adapter
             should operate on an MPN or deliberately selected working set, preserve provenance, and present
-            SOLD research for review before it becomes a dated research session.
+            SOLD research for review before it becomes a dated research session. The eBay API adapters stay
+            dormant unless EBAY_AUTOMATED_RESEARCH_ENABLED is exactly &quot;true&quot;.
           </p>
         </div>
       </Panel>

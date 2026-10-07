@@ -4,6 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { z } from 'zod'
 
 import { getPartByMpn, insertActiveSnapshots, saveMarketResearchSession } from '@/db/queries'
+import { AUTOMATED_EBAY_RESEARCH_DISABLED, isAutomatedEbayResearchEnabled } from '@/lib/ebay/automation-gate'
 import { fetchActiveMarket } from '@/lib/ebay/browse'
 import { requireSession } from '@/lib/session'
 import { PERIODS } from '@/lib/types'
@@ -25,6 +26,12 @@ export async function captureActiveResearch(input: {
   mpn: string
 }): Promise<CaptureActiveResult> {
   await requireSession()
+
+  // The Tracker hides Capture Active in manual-only mode, but a server action
+  // is reachable by direct POST, so the gate lives here too.
+  if (!isAutomatedEbayResearchEnabled()) {
+    return { ok: false, error: AUTOMATED_EBAY_RESEARCH_DISABLED }
+  }
 
   const parsed = activeCaptureSchema.safeParse(input)
   if (!parsed.success) {

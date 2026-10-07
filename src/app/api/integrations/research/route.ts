@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 
+import { AUTOMATED_EBAY_RESEARCH_DISABLED, isAutomatedEbayResearchEnabled } from '@/lib/ebay/automation-gate'
 import { isEbayConfigured } from '@/lib/ebay/client'
 import { researchExactMpns } from '@/lib/ebay/exact-mpn-research'
 import { checkIntegrationAuth } from '@/lib/integration-auth'
@@ -17,6 +18,9 @@ export const maxDuration = 300
  * only already-registered parts through the official eBay APIs and reports a
  * per-MPN outcome; read the saved facts from /api/integrations/market-facts.
  * Errors carry this app's own wording only — never eBay bodies or keys.
+ *
+ * Manual-only by default: unless EBAY_AUTOMATED_RESEARCH_ENABLED is exactly
+ * "true", a valid request answers 503 before any part lookup or eBay call.
  */
 export async function POST(request: Request) {
   const auth = checkIntegrationAuth(request.headers.get('authorization'))
@@ -40,6 +44,13 @@ export async function POST(request: Request) {
   const parsed = parseTargetedResearchRequest(body)
   if (!parsed.ok) {
     return NextResponse.json({ error: parsed.error }, { status: 400, headers: NO_STORE })
+  }
+
+  if (!isAutomatedEbayResearchEnabled()) {
+    return NextResponse.json(
+      { error: AUTOMATED_EBAY_RESEARCH_DISABLED },
+      { status: 503, headers: NO_STORE },
+    )
   }
 
   if (!isEbayConfigured()) {

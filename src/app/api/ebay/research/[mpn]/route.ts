@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 
+import { AUTOMATED_EBAY_RESEARCH_DISABLED, isAutomatedEbayResearchEnabled } from '@/lib/ebay/automation-gate'
 import { EbayError, isEbayConfigured } from '@/lib/ebay/client'
 import { fetchSoldWindows } from '@/lib/ebay/insights'
 import { hasValidSession } from '@/lib/session'
@@ -9,6 +10,10 @@ export const maxDuration = 60
 export async function GET(_request: Request, props: { params: Promise<{ mpn: string }> }) {
   if (!(await hasValidSession())) {
     return NextResponse.json({ error: 'Not signed in.' }, { status: 401 })
+  }
+
+  if (!isAutomatedEbayResearchEnabled()) {
+    return NextResponse.json({ error: AUTOMATED_EBAY_RESEARCH_DISABLED }, { status: 503 })
   }
 
   if (!isEbayConfigured()) {

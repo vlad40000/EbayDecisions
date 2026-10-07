@@ -91,6 +91,33 @@ https://www.ebay.com/sch/i.html?_nkw=<MPN>&LH_Sold=1&LH_Complete=1
 
 The user reviews those results, enters the five Product Research windows, and presses **SAVE RESEARCH**. There is no autosave, polling, scheduled catalogue sweep, or automatic 40,000-part research loop.
 
+## Manual-only eBay gate
+
+EbayDecisions is manual-only by default: no server-side code calls the eBay APIs unless `EBAY_AUTOMATED_RESEARCH_ENABLED` is exactly `true`. Unset, empty, `false`, `TRUE`, `1` and every other value mean manual-only. eBay credentials alone never enable automated research.
+
+In manual-only mode each automated path returns before contacting eBay, and none of them writes a snapshot, research session or sync run:
+
+| Path | Manual-only behavior |
+| --- | --- |
+| Tracker **Capture Active** | Hidden, with a **Manual-only** chip in its place. The `captureActiveResearch` server action also refuses. |
+| `POST /api/integrations/research` | `503` after integration auth and request validation. |
+| `GET /api/ebay/preview/[mpn]` | `503` |
+| `GET /api/ebay/research/[mpn]` | `503` |
+| `POST /api/ebay/sync` | `200` with `status: "skipped"` |
+| `GET /api/cron/sync` | `200` with `status: "skipped"`. Still also requires `EBAY_CRON_ENABLED="true"` and `CRON_SECRET`. |
+
+As a backstop, the eBay client refuses to request a token or call an API while the flag is off, so a caller that skips the check still cannot reach eBay. The check lives in `src/lib/ebay/automation-gate.ts`.
+
+Manual-only mode does not affect anything that never called the eBay APIs:
+
+- MPN-only Active / Sold eBay links and Seller Hub Product Research links
+- manual entry and **SAVE RESEARCH**
+- `POST /api/integrations/parts/register`
+- `POST /api/integrations/market-facts`, which keeps serving stored facts, including earlier automated snapshots
+- Inventory and import/export
+
+The official Browse and Marketplace Insights adapter code stays in `src/lib/ebay/`, dormant until the flag is set. With `EBAY_AUTOMATED_RESEARCH_ENABLED="true"` and credentials configured, the adapters behave exactly as before.
+
 ## Market Opportunities
 
 The Opportunities surface is designed for a 40,000+ part catalogue.
@@ -217,6 +244,7 @@ The application is intentionally conservative with Neon compute:
 - explicit quantity saves in Inventory
 - explicit SAVE RESEARCH in Tracker
 - server-side pagination instead of full-catalogue reads
+- no eBay API calls unless `EBAY_AUTOMATED_RESEARCH_ENABLED="true"`
 - no scheduled eBay research cron
 - no automatic 40,000-part research sweep
 
@@ -247,7 +275,7 @@ APP_PASSWORD
 AUTH_SECRET
 ```
 
-eBay credentials are optional and are not required for the manual Product Research workflow.
+eBay credentials are optional and are not required for the manual Product Research workflow. Even with credentials set, the eBay API adapters stay dormant unless `EBAY_AUTOMATED_RESEARCH_ENABLED="true"` (see [Manual-only eBay gate](#manual-only-ebay-gate)).
 
 ## Verification
 
