@@ -114,7 +114,7 @@ Manual-only mode does not affect anything that never called the eBay APIs:
 - manual entry and **SAVE RESEARCH**
 - `POST /api/integrations/parts/register`
 - `POST /api/integrations/market-facts`, which keeps serving stored facts, including earlier automated snapshots
-- Inventory and import/export
+- Inventory and import/export, including the [shared research CSV](#shared-manual-research-csv)
 
 The official Browse and Marketplace Insights adapter code stays in `src/lib/ebay/`, dormant until the flag is set. With `EBAY_AUTOMATED_RESEARCH_ENABLED="true"` and credentials configured, the adapters behave exactly as before.
 
@@ -196,6 +196,28 @@ A mature trend requires:
 
 With fewer than 2 dates, the UI shows an explicit insufficient-history state. It never fabricates chart data.
 
+## Shared manual-research CSV
+
+Parts Engine and EbayDecisions read and write one CSV shape, so the same file moves between them without conversion. The canonical export uses these columns in this order:
+
+```text
+mpn, description, notes, New Price, 7 Day sales, 7 Day Avg Price, 30 Day sales, 30 Day Avg Price, 90 Day sales, 90 Day Avg Price, 90 Day Sell Through %
+```
+
+`GET /api/research/shared-csv` downloads every active part, or with `?scope=due` the Research Queue default (in stock, never researched or stale). `POST /api/research/shared-csv` imports a completed file. Both need a signed-in session, appear under Settings, and work in manual-only mode with no eBay request.
+
+Import rules:
+
+- headers match after ignoring case, spaces, underscores, hyphens and surrounding whitespace; other columns are ignored
+- the whole file is validated first, and any bad row means nothing is imported
+- unknown MPNs are registered from MPN + description with inventory 0; existing parts' catalogue fields are not touched
+- each row with at least one 7d/30d/90d value becomes a new `ebay_product_research_manual` session (sold basis, dated at import time); a row with no values creates no session, and earlier sessions are never edited
+- blank cells stay unknown, never zero, and `90 Day Sell Through %` is stored only when supplied, never derived
+- `New Price` goes to `parts.new_price` only. It is not cost basis, inventory, a sold comp or an asking price, and decision math does not read it. A blank cell leaves the stored value alone
+- `notes` is kept as session text and never parsed, so Parts Engine donor/model text cannot change inventory or market facts
+
+The export takes each window from the newest manual sold-basis research, so automated or unknown-basis rows are never exported as manual research. Unknown values are left blank. The full diagnostic export at `/api/parts/export` is separate and unchanged.
+
 ## Inventory boundary
 
 Inventory is context, not a second warehouse system.
@@ -221,6 +243,8 @@ Current migration sequence includes:
 - `0001_*.sql`
 - `0002_market_semantics.sql`
 - `0003_market_research_sessions.sql`
+- `0004_parts_mpn_key.sql`
+- `0005_parts_new_price.sql`
 
 Migration `0002` separates sold demand from point-in-time active competition.
 
@@ -232,6 +256,8 @@ Migration `0003` adds:
 - research-session and catalogue search indexes
 
 Production `0003` has been applied.
+
+Migration `0005` adds a nullable `parts.new_price` (the shared CSV's `New Price`). It is additive, so existing rows stay unknown.
 
 ## Neon compute discipline
 

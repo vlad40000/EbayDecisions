@@ -7,6 +7,11 @@ import { categoryOf } from '@/lib/categories'
 import { toDbNumeric, toNumber } from '@/lib/format'
 import type { MarketFactsV1 } from '@/lib/market-facts'
 import { toMpnKey } from '@/lib/mpn'
+import type {
+  SharedResearchExportRow,
+  SharedResearchPeriod,
+  SharedResearchRow,
+} from '@/lib/shared-research-csv'
 import { timeTrend } from '@/lib/stats'
 import {
   PERIOD_DAYS,
@@ -36,7 +41,8 @@ import {
 
 // ─── Mapping ──────────────────────────────────────────────────────────────────
 
-function mapPart(row: Omit<typeof parts.$inferSelect, 'mpnKey'>): Part {
+/** `newPrice` is deliberately not part of `Part`: decision math never sees it. */
+function mapPart(row: Omit<typeof parts.$inferSelect, 'mpnKey' | 'newPrice'>): Part {
   return {
     id: row.id,
     mpn: row.mpn,
@@ -1199,6 +1205,210 @@ export async function researchSessionHistory(
     createdAt: session.createdAt.toISOString(),
     periods: bySession.get(session.id) ?? {},
   }))
+}
+
+// ─── Shared manual-research CSV ───────────────────────────────────────────────
+
+export type SharedResearchExportScope = 'all' | 'due'
+
+/** Newest manual, sold-basis row per part for one window. */
+function latestManualSoldWindow(period: SharedResearchPeriod, name: string) {
+  return db
+    .selectDistinctOn([marketSnapshots.partId], {
+      partId: marketSnapshots.partId,
+      soldQty: marketSnapshots.soldQty,
+      price: marketSnapshots.price,
+      sellThroughPct: marketSnapshots.sellThroughPct,
+    })
+    .from(marketSnapshots)
+    .where(
+      and(
+        eq(marketSnapshots.period, period),
+        eq(marketSnapshots.source, 'manual'),
+        eq(marketSnapshots.priceBasis, 'sold'),
+      ),
+    )
+    .orderBy(marketSnapshots.partId, desc(marketSnapshots.capturedAt), desc(marketSnapshots.id))
+    .as(name)
+}
+
+/**
+ * Rows for the canonical shared research CSV, in one statement.
+ *
+ * Each window carries the newest manual sold-basis research for that window,
+ * so automated and unknown/asking-basis rows are never exported as manual
+ * research; 90-day sell-through comes from the same row as the 90-day sales.
+ * `notes` is the newest research session's notes. `all` is every active part
+ * by MPN; `due` is the Research Queue default — in stock, never researched or
+ * researched before the stale cutoff, oldest first.
+ */
+export async function listSharedResearchExportRows(
+  options: { scope?: SharedResearchExportScope; staleDays?: number } = {},
+): Promise<SharedResearchExportRow[]> {
+  const scope = options.scope ?? 'all'
+  const staleDays = Math.min(3650, Math.max(1, Math.trunc(options.staleDays ?? 30)))
+  const staleCutoff = new Date(Date.now() - staleDays * 86_400_000)
+
+  const latestSession = db
+    .selectDistinctOn([marketResearchSessions.partId], {
+      partId: marketResearchSessions.partId,
+      researchedAt: marketResearchSessions.researchedAt,
+      notes: marketResearchSessions.notes,
+    })
+    .from(marketResearchSessions)
+    .orderBy(
+      marketResearchSessions.partId,
+      desc(marketResearchSessions.researchedAt),
+      desc(marketResearchSessions.id),
+    )
+    .as('shared_latest_session')
+  const window7d = latestManualSoldWindow('7d', 'shared_7d')
+  const window30d = latestManualSoldWindow('30d', 'shared_30d')
+  const window90d = latestManualSoldWindow('90d', 'shared_90d')
+
+  const conditions = [eq(parts.active, true)]
+  if (scope === 'due') {
+    conditions.push(gt(parts.inventoryQty, 0))
+    const due = or(isNull(latestSession.partId), lt(latestSession.researchedAt, staleCutoff))
+    if (due) conditions.push(due)
+  }
+
+  const order =
+    scope === 'due'
+      ? [
+          sql`CASE WHEN ${latestSession.partId} IS NULL THEN 0 ELSE 1 END`,
+          latestSession.researchedAt,
+          desc(parts.inventoryQty),
+          parts.mpn,
+        ]
+      : [parts.mpn]
+
+  return db
+    .select({
+      mpn: parts.mpn,
+      description: parts.description,
+      notes: latestSession.notes,
+      newPrice: parts.newPrice,
+      sold7d: window7d.soldQty,
+      avgPrice7d: window7d.price,
+      sold30d: window30d.soldQty,
+      avgPrice30d: window30d.price,
+      sold90d: window90d.soldQty,
+      avgPrice90d: window90d.price,
+      sellThrough90dPct: window90d.sellThroughPct,
+    })
+    .from(parts)
+    .leftJoin(latestSession, eq(latestSession.partId, parts.id))
+    .leftJoin(window7d, eq(window7d.partId, parts.id))
+    .leftJoin(window30d, eq(window30d.partId, parts.id))
+    .leftJoin(window90d, eq(window90d.partId, parts.id))
+    .where(and(...conditions))
+    .orderBy(...order)
+}
+
+/** Sets supplied New Prices by D1 key; an unchanged value is not rewritten. */
+async function setPartNewPrices(entries: { mpnKey: string; newPrice: number }[]): Promise<void> {
+  for (let start = 0; start < entries.length; start += 1000) {
+    const chunk = entries.slice(start, start + 1000)
+    await db.execute(sql`
+      UPDATE ${parts} AS p
+      SET new_price = v.new_price, updated_at = now()
+      FROM (
+        VALUES ${sql.join(
+          chunk.map((entry) => sql`(${entry.mpnKey}::text, ${toDbNumeric(entry.newPrice)}::numeric(10,2))`),
+          sql`, `,
+        )}
+      ) AS v(mpn_key, new_price)
+      WHERE p.mpn_key = v.mpn_key AND p.new_price IS DISTINCT FROM v.new_price
+    `)
+  }
+}
+
+export type SharedResearchImportSummary = {
+  registered: number
+  existing: number
+  sessions: number
+  windows: number
+  newPrices: number
+  errors: string[]
+}
+
+/**
+ * Saves validated shared-CSV rows. No eBay call is made.
+ *
+ * Unknown MPNs are registered insert-only from MPN + description (inventory 0,
+ * blank economics); an existing part's catalogue fields are never touched.
+ * A supplied New Price sets `parts.new_price` and nothing else; a blank one
+ * leaves the stored value alone. Each row with at least one supplied window
+ * becomes its own append-only `ebay_product_research_manual` session dated
+ * `researchedAt`, carrying the row's notes as text; a row with no research
+ * values creates no session. Re-importing a corrected file therefore adds
+ * newer sessions and never edits earlier ones.
+ */
+export async function importSharedResearchRows(
+  rows: SharedResearchRow[],
+  options: { researchedAt: Date },
+): Promise<SharedResearchImportSummary> {
+  const summary: SharedResearchImportSummary = {
+    registered: 0,
+    existing: 0,
+    sessions: 0,
+    windows: 0,
+    newPrices: 0,
+    errors: [],
+  }
+
+  const partIdByKey = new Map<string, number>()
+  for (let start = 0; start < rows.length; start += 500) {
+    const chunk = rows.slice(start, start + 500)
+    const results = await registerPartsByMpnKey(
+      chunk.map((row) => ({ mpnKey: row.mpnKey, mpnDisplay: row.mpnDisplay, description: row.description })),
+    )
+    for (const result of results) {
+      if (result.status === 'inserted') summary.registered += 1
+      else summary.existing += 1
+    }
+    for (const part of await findPartsByMpnKeys(chunk.map((row) => row.mpnKey))) {
+      partIdByKey.set(part.mpnKey, part.id)
+    }
+  }
+
+  const priced = rows.flatMap((row) =>
+    row.newPrice == null ? [] : [{ mpnKey: row.mpnKey, newPrice: row.newPrice }],
+  )
+  await setPartNewPrices(priced)
+  summary.newPrices = priced.length
+
+  for (const row of rows) {
+    if (row.windows.length === 0) continue
+    const partId = partIdByKey.get(row.mpnKey)
+    if (partId === undefined) {
+      summary.errors.push(`Line ${row.line} (${row.mpnDisplay}): the part could not be found after registration.`)
+      continue
+    }
+    try {
+      summary.windows += await saveMarketResearchSession({
+        partId,
+        researchedAt: options.researchedAt,
+        source: 'ebay_product_research_manual',
+        notes: row.notes,
+        windows: row.windows.map((window) => ({
+          period: window.period,
+          avgSoldPrice: window.avgSoldPrice,
+          avgShipping: null,
+          totalSold: window.totalSold,
+          sellThroughPct: window.sellThroughPct,
+        })),
+      })
+      summary.sessions += 1
+    } catch (error) {
+      summary.errors.push(
+        `Line ${row.line} (${row.mpnDisplay}): ${error instanceof Error ? error.message : 'could not save research'}`,
+      )
+    }
+  }
+
+  return summary
 }
 
 // ─── Explicit manual save ─────────────────────────────────────────────────────

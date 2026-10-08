@@ -36,6 +36,13 @@
       "when": 1791320687870,
       "tag": "0004_parts_mpn_key",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1791407608492,
+      "tag": "0005_parts_new_price",
+      "breakpoints": true
     }
   ]
 }
